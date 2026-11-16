@@ -1,5 +1,5 @@
 import { Trans, useLingui } from '@lingui/react/macro'
-import { Link } from '@tanstack/react-router'
+import { Link, useNavigate } from '@tanstack/react-router'
 import { cva } from 'class-variance-authority'
 import { FileDownIcon, PencilIcon, PinIcon, PinOffIcon, ThumbsDownIcon, ThumbsUpIcon, VerifiedIcon } from 'lucide-react'
 import { toast } from 'sonner'
@@ -15,6 +15,7 @@ import { useProfile } from '@/hooks/use_profile.ts'
 import { GameType, Guide, GuidesOrFolder } from '@/ipc/bindings.ts'
 import { GuideWithStepsWithFolder } from '@/ipc/ipc.ts'
 import { clamp } from '@/lib/clamp.ts'
+import { useGuideEdit } from '@/lib/guide_edit.ts'
 import { cn } from '@/lib/utils.ts'
 import { MAX_PINNED_PER_PROFILE, useTogglePinnedGuide } from '@/mutations/toggle_pinned_guide.mutation.ts'
 
@@ -145,8 +146,10 @@ export function GuideItem(props: GuideItemProps) {
 
 function LocalGuideItem({ guide, isSelected, onSelect, isSelectMode, isPinned, pinnedCount }: LocalGuideItemProps) {
   const { t } = useLingui()
+  const navigate = useNavigate()
   const profile = useProfile()
   const togglePinned = useTogglePinnedGuide()
+  const startEdit = useGuideEdit((state) => state.startEdit)
   const totalSteps = guide.steps.length
   const currentStepIndex = guide.currentStep ?? 0
   const step = clamp(currentStepIndex + 1, 1, totalSteps)
@@ -292,6 +295,21 @@ function LocalGuideItem({ guide, isSelected, onSelect, isSelectMode, isPinned, p
     <ContextMenu>
       <ContextMenuTrigger asChild>{card}</ContextMenuTrigger>
       <ContextMenuContent>
+        <ContextMenuItem
+          onSelect={async () => {
+            // Open the guide straight in the edition mode: right click on a guide is
+            // the second entry point of the feature, next to the header pencil.
+            startEdit(guide)
+            await navigate({
+              to: '/guides/$id',
+              params: { id: guide.id },
+              search: { step: currentStepIndex },
+            })
+          }}
+        >
+          <PencilIcon className="size-4" />
+          <Trans>Modifier le guide</Trans>
+        </ContextMenuItem>
         <ContextMenuItem onSelect={onTogglePin}>
           {isPinned ? (
             <>

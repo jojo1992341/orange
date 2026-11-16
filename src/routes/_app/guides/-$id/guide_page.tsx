@@ -31,6 +31,7 @@ import { useSetConf } from '@/mutations/set_conf.mutation.ts'
 import { confQuery } from '@/queries/conf.query.ts'
 import { GuideActionsDropdown } from '@/routes/_app/guides/-$id/guide_actions_dropdown.tsx'
 
+import { GuideEditModeButton } from './edit_mode_button.tsx'
 import { GuideEditPanel } from './guide_edit_panel.tsx'
 import { GuideNotesDialog, GuideNotesMenuTrigger } from './guide_notes_dialog.tsx'
 import { ReportDialog, ReportDialogTrigger } from './report_dialog.tsx'
@@ -272,32 +273,43 @@ export function GuidePage({ id, stepIndex: index }: { id: number; stepIndex: num
                 />
               </div>
 
-              {/* Right Side - Fixed width to maintain center balance */}
-              <div className="hidden w-20 shrink-0 items-center justify-end pr-1 xs:flex sm:w-24">
-                <GuideNotesMenuTrigger
-                  guideId={guide.id}
-                  onOpenGuideNotes={() => setGuideNotesOpen(true)}
-                  onOpenNote={handleOpenNote}
-                  stepIndex={index}
-                />
-                {showSummary && <SummaryDialogTrigger onClick={() => setSummaryOpen(true)} />}
-                {showReport && <ReportDialogTrigger onClick={() => setReportOpen(true)} />}
-              </div>
-              <div className="flex w-fit shrink-0 items-center justify-end pr-1 xs:hidden">
-                <GuideActionsDropdown
-                  guideId={guide.id}
+              {/*
+                Right Side - The edition mode button is always rendered: it is the only
+                entry point of the feature, and the "..." dropdown below only exists on
+                very narrow windows (below 320px).
+              */}
+              <div className="flex w-fit shrink-0 items-center justify-end gap-0.5 pr-1">
+                <GuideEditModeButton
                   isEditMode={editMode}
-                  isGuideEditPending={duplicateGuide.isPending}
-                  onDuplicateGuide={handleDuplicateGuide}
-                  onOpenGuideNotes={() => setGuideNotesOpen(true)}
-                  onOpenNote={handleOpenNote}
-                  onOpenReport={() => setReportOpen(true)}
-                  onOpenSummary={() => setSummaryOpen(true)}
-                  onToggleEditMode={handleToggleEditMode}
-                  showReport={showReport}
-                  showSummary={showSummary}
-                  stepIndex={index}
+                  isPending={duplicateGuide.isPending}
+                  onClick={handleToggleEditMode}
                 />
+                <div className="hidden items-center xs:flex">
+                  <GuideNotesMenuTrigger
+                    guideId={guide.id}
+                    onOpenGuideNotes={() => setGuideNotesOpen(true)}
+                    onOpenNote={handleOpenNote}
+                    stepIndex={index}
+                  />
+                  {showSummary && <SummaryDialogTrigger onClick={() => setSummaryOpen(true)} />}
+                  {showReport && <ReportDialogTrigger onClick={() => setReportOpen(true)} />}
+                </div>
+                <div className="flex items-center xs:hidden">
+                  <GuideActionsDropdown
+                    guideId={guide.id}
+                    isEditMode={editMode}
+                    isGuideEditPending={duplicateGuide.isPending}
+                    onDuplicateGuide={handleDuplicateGuide}
+                    onOpenGuideNotes={() => setGuideNotesOpen(true)}
+                    onOpenNote={handleOpenNote}
+                    onOpenReport={() => setReportOpen(true)}
+                    onOpenSummary={() => setSummaryOpen(true)}
+                    onToggleEditMode={handleToggleEditMode}
+                    showReport={showReport}
+                    showSummary={showSummary}
+                    stepIndex={index}
+                  />
+                </div>
               </div>
             </>
           )}

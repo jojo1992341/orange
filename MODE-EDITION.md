@@ -8,7 +8,9 @@ qu'une mise à jour venue du serveur n'écrase le travail.
 
 | Action | Où |
 | --- | --- |
-| Activer / quitter le mode édition | Menu « ⋯ » d'un guide → **Mode édition** |
+| Activer / quitter le mode édition | **Icône crayon** dans la barre du guide ouvert, à gauche des icônes note / sommaire / rapport (toujours visible, quelle que soit la taille de la fenêtre) |
+| Activer le mode édition depuis la liste | **Clic droit** sur un guide → **Modifier le guide** (le guide s'ouvre directement en édition) |
+| Activer le mode édition (fenêtre < 320 px) | Menu « ⋯ » d'un guide → **Mode édition** |
 | Renommer le guide | Champ **Nom du guide** |
 | Modifier le contenu d'une étape | Onglet **Contenu** (HTML de l'étape) + **Aperçu** |
 | Renommer une étape, changer sa carte / ses coordonnées | Champs au-dessus de l'éditeur |
@@ -20,6 +22,9 @@ qu'une mise à jour venue du serveur n'écrase le travail.
 | Revenir à la version Ganymède du guide | **Rétablir le guide original** |
 | Créer un guide vide | Bouton **+** de la bibliothèque des guides |
 | Dupliquer un guide existant | Menu « ⋯ » → **Dupliquer le guide** |
+
+Le bouton crayon est coloré (accent) tant que le mode édition est actif ; un second clic
+le quitte, avec un avertissement si le brouillon n'est pas enregistré.
 
 Le contenu d'une étape est le HTML utilisé par Ganymède : les coordonnées écrites
 `[12,-8]` deviennent automatiquement des positions cliquables, et les blocs existants
@@ -89,6 +94,10 @@ Autres points :
   sera régénéré tel quel par `pnpm tauri dev` / `pnpm tauri build`.
 - État du brouillon : `src/lib/guide_edit.ts` (Zustand) + tests
   `src/lib/guide_edit.test.ts` (15 tests).
+- Entrée du mode édition : `src/routes/_app/guides/-$id/edit_mode_button.tsx`. Elle est
+  rendue **hors** du menu « ⋯ », car ce menu n'existe qu'en dessous de 320 px de large
+  (le reste du temps, Ganymède affiche les icônes séparées) : c'est ce qui rendait la
+  fonctionnalité invisible dans une fenêtre de taille normale.
 
 Vérifications effectuées sur cette livraison : `pnpm typecheck`, `pnpm lint`,
 `pnpm test` (38 tests) et `pnpm format:check`.

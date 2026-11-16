@@ -1,0 +1,46 @@
+import { Slot } from '@radix-ui/react-slot'
+import { cva, type VariantProps } from 'class-variance-authority'
+import * as React from 'react'
+
+import { cn } from '@/lib/utils.ts'
+
+const buttonVariants = cva(
+  'inline-flex cursor-pointer items-center justify-center gap-2 rounded-md text-xs font-medium whitespace-nowrap transition-colors focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-hidden disabled:pointer-events-none disabled:opacity-50 aria-disabled:pointer-events-none aria-disabled:opacity-50 xs:text-sm [&_svg]:pointer-events-none [&_svg]:size-3 [&_svg]:shrink-0 xs:[&_svg]:size-4',
+  {
+    variants: {
+      variant: {
+        default: 'border border-accent bg-surface-inset text-primary-foreground shadow-sm hover:bg-surface-inset/80',
+        destructive: 'bg-destructive text-destructive-foreground shadow-xs hover:bg-destructive/90',
+        outline:
+          'border border-border-muted bg-surface-card shadow-xs hover:bg-surface-inset hover:text-primary-foreground',
+        secondary: 'bg-surface-inset text-primary-foreground shadow-xs hover:bg-surface-inset/80',
+        ghost: 'hover:bg-surface-inset hover:text-primary-foreground',
+        link: 'text-accent underline-offset-4 hover:underline',
+      },
+      size: {
+        default: 'h-6 px-2 py-1 sm:h-9 sm:px-4 sm:py-2',
+        sm: 'h-8 rounded-md px-3',
+        lg: 'h-10 rounded-md px-8 py-2 text-sm xs:text-base',
+        icon: 'size-6 sm:size-7',
+        ['icon-sm']: 'size-7 min-h-7 min-w-7',
+      },
+    },
+    defaultVariants: {
+      variant: 'default',
+      size: 'default',
+    },
+  },
+)
+
+export type ButtonVariant = VariantProps<typeof buttonVariants>
+
+export interface ButtonProps extends React.ComponentPropsWithRef<'button'>, VariantProps<typeof buttonVariants> {
+  asChild?: boolean
+}
+
+function Button({ className, variant, size, asChild = false, ref, ...props }: ButtonProps) {
+  const Comp = asChild ? Slot : 'button'
+  return <Comp className={cn(buttonVariants({ variant, size, className }))} ref={ref} {...props} />
+}
+
+export { Button, buttonVariants }

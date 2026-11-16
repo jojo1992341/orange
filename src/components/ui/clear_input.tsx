@@ -1,0 +1,42 @@
+import { XIcon } from 'lucide-react'
+import * as React from 'react'
+
+import { cn } from '@/lib/utils.ts'
+
+import { Input } from './input.tsx'
+
+export interface ClearInputProps extends React.ComponentPropsWithRef<'input'> {
+  onValueChange?: (value: string) => void
+}
+
+function ClearInput({ className, onValueChange, value, type, ref, ...props }: ClearInputProps) {
+  return (
+    <div className="relative z-0 flex w-full">
+      <Input
+        className={cn('peer border-border-muted bg-surface-card', className)}
+        type={type}
+        {...props}
+        onKeyDown={(evt) => {
+          if (evt.key === 'Escape') {
+            evt.preventDefault()
+            evt.stopPropagation()
+            onValueChange?.('')
+          }
+        }}
+        ref={ref}
+        value={value}
+      />
+      <button
+        className="center-y-absolute right-2 opacity-0 transition-opacity peer-has-value:opacity-100"
+        onClick={() => {
+          onValueChange?.('')
+        }}
+        type="button"
+      >
+        <XIcon className="size-4" />
+      </button>
+    </div>
+  )
+}
+
+export { ClearInput }

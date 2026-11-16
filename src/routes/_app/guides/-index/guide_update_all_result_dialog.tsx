@@ -1,0 +1,113 @@
+import { Trans } from '@lingui/react/macro'
+import { useSuspenseQuery } from '@tanstack/react-query'
+import { PropsWithChildren, Suspense } from 'react'
+
+import { Button } from '@/components/ui/button.tsx'
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog.tsx'
+import { ScrollArea } from '@/components/ui/scroll_area.tsx'
+import { UpdateAllAtOnceResult } from '@/ipc/bindings.ts'
+import { getGuideById } from '@/lib/guide.ts'
+import { guidesQuery } from '@/queries/guides.query.ts'
+
+function SkippedItem({ guideId }: { guideId: number }) {
+  const guides = useSuspenseQuery(guidesQuery())
+
+  const guide = getGuideById(guides.data, guideId)
+
+  return (
+    <div className="flex flex-col items-center gap-1 rounded-lg border border-accent/50 bg-surface-card p-2 leading-5">
+      <h3 className="text-sm font-semibold">
+        {guide ? (
+          <>
+            ID {guide.id} — {guide.name}
+          </>
+        ) : (
+          <>ID {guideId}</>
+        )}
+      </h3>
+      <p className="px-4 text-center text-balance">
+        <Trans>
+          Ce guide a été modifié localement : il est conservé tel quel. Utilisez « Rétablir le guide original » depuis
+          le mode édition pour reprendre la version de Ganymède.
+        </Trans>
+      </p>
+    </div>
+  )
+}
+
+function Item({ guideId, error }: { guideId: number; error: string }) {
+  const guides = useSuspenseQuery(guidesQuery())
+
+  const guide = getGuideById(guides.data, guideId)
+
+  return (
+    <div className="flex flex-col items-center gap-1 rounded-lg border border-amber-500/50 bg-surface-card p-2 leading-5">
+      <h3 className="text-sm font-semibold">
+        {guide ? (
+          <>
+            ID {guide.id} — {guide.name}
+          </>
+        ) : (
+          <>ID {guideId}</>
+        )}
+      </h3>
+      <p className="px-4 text-center text-balance">{error}</p>
+    </div>
+  )
+}
+
+export function GuideUpdateAllResultDialog({
+  children,
+  result,
+}: PropsWithChildren<{ result: Partial<Record<number, UpdateAllAtOnceResult>> }>) {
+  return (
+    <Dialog>
+      <DialogTrigger asChild>{children}</DialogTrigger>
+      <DialogContent className="flex h-full max-h-[90vh] flex-col">
+        <DialogHeader>
+          <DialogTitle>
+            <Trans>Mise à jour des guides</Trans>
+          </DialogTitle>
+          <DialogDescription>
+            <Trans>Certains guides n'ont pas été mis à jour ou ont été conservés tels quels</Trans>
+          </DialogDescription>
+        </DialogHeader>
+
+        <ScrollArea className="h-full">
+          <div className="flex flex-col gap-2">
+            {Object.entries(result)
+              .filter(([, v]) => v?.type === 'failure')
+              .map(([id, error]) => (
+                <Suspense key={id}>
+                  <Item error={(error as { type: 'failure'; message: string }).message} guideId={Number(id)} />
+                </Suspense>
+              ))}
+            {Object.entries(result)
+              .filter(([, v]) => v?.type === 'skipped')
+              .map(([id]) => (
+                <Suspense key={id}>
+                  <SkippedItem guideId={Number(id)} />
+                </Suspense>
+              ))}
+          </div>
+        </ScrollArea>
+        <DialogFooter>
+          <DialogClose asChild>
+            <Button variant="outline">
+              <Trans>Fermer</Trans>
+            </Button>
+          </DialogClose>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}

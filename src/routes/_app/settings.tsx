@@ -1,0 +1,427 @@
+import { Trans, useLingui } from '@lingui/react/macro'
+import { useQueryClient, useSuspenseQuery } from '@tanstack/react-query'
+import { createFileRoute } from '@tanstack/react-router'
+import { useDebounce } from '@uidotdev/usehooks'
+import { TriangleAlertIcon } from 'lucide-react'
+import { type PropsWithChildren, type ReactNode, useEffect, useState } from 'react'
+import { toast } from 'sonner'
+import { z } from 'zod'
+
+import { GenericLoader } from '@/components/generic_loader.tsx'
+import { PageScrollableContent } from '@/components/page_scrollable_content.tsx'
+import { SelectLangLabel, SelectLangSelect } from '@/components/select_lang.tsx'
+import { ShortcutInput } from '@/components/shortcut_input.tsx'
+import { ThemeSelector } from '@/components/theme_selector.tsx'
+import { Button } from '@/components/ui/button.tsx'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card.tsx'
+import { Input } from '@/components/ui/input.tsx'
+import { Label } from '@/components/ui/label.tsx'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select.tsx'
+import { Slider } from '@/components/ui/slider.tsx'
+import { Switch } from '@/components/ui/switch.tsx'
+import { useSwitchProfile } from '@/hooks/use_switch_profile.ts'
+import { ConfLang, FontSize, GuideDisplay, type Shortcuts } from '@/ipc/bindings.ts'
+import { createProfileRemote } from '@/ipc/sync.ts'
+import { cn } from '@/lib/utils.ts'
+import { useNewId } from '@/mutations/new_id.mutation.ts'
+import { useReregisterShortcuts } from '@/mutations/reregister_shortcuts.mutation.ts'
+import { useSetConf } from '@/mutations/set_conf.mutation.ts'
+import { confQuery } from '@/queries/conf.query.ts'
+import { Page } from '@/routes/-page.tsx'
+import { Profiles } from '@/routes/_app/-settings/profiles.tsx'
+
+import { BackButtonLink } from './downloads/-back_button_link.tsx'
+
+const SearchZod = z.object({
+  from: z.string().optional(),
+  hash: z.string().optional(),
+  state: z.any().optional(),
+  search: z.any().optional(),
+})
+
+export const Route = createFileRoute('/_app/settings')({
+  validateSearch: SearchZod.parse,
+  component: Settings,
+  loader: async ({ context }) => {
+    await context.queryClient.ensureQueryData(confQuery)
+  },
+  pendingComponent: () => {
+    const { t } = useLingui()
+
+    return (
+      <Page key="settings-page" title={t`Paramètres`}>
+        <PageScrollableContent className="flex items-center justify-center">
+          <GenericLoader />
+        </PageScrollableContent>
+      </Page>
+    )
+  },
+  pendingMs: 200,
+})
+
+function SettingCard({
+  title,
+  description,
+  id,
+  className,
+  children,
+}: PropsWithChildren<{ title: ReactNode; description?: ReactNode; id: string; className?: string }>) {
+  return (
+    <Card className={cn('flex flex-col gap-2 text-sm', className)}>
+      <CardHeader className="xs:pb-2">
+        <CardTitle>{title}</CardTitle>
+        {description && <CardDescription>{description}</CardDescription>}
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4 xs:pt-2" id={id}>
+        {children}
+      </CardContent>
+    </Card>
+  )
+}
+
+function SettingCardSection({ id, children }: PropsWithChildren<{ id: string }>) {
+  return (
+    <section className="flex flex-col gap-2" id={id}>
+      {children}
+    </section>
+  )
+}
+
+function Settings() {
+  const { t } = useLingui()
+  const { from, hash, state, search } = Route.useSearch()
+  const queryClient = useQueryClient()
+  const newId = useNewId()
+  const conf = useSuspenseQuery(confQuery)
+  const setConf = useSetConf()
+  const reregisterShortcuts = useReregisterShortcuts()
+  const switchProfile = useSwitchProfile()
+  const [opacity, setOpacity] = useState(conf.data.opacity)
+  const opacityDebounced = useDebounce(opacity, 300)
+
+  // oxlint-disable react-hooks/exhaustive-deps -- no need more deps
+  useEffect(() => {
+    setConf.mutate({
+      ...conf.data,
+      opacity: opacityDebounced,
+    })
+  }, [opacityDebounced])
+  // oxlint-enable react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    window.document.documentElement.style.setProperty('--opacity', `${opacity.toFixed(2)}`)
+  }, [opacity])
+
+  const updateShortcut = async (field: keyof Shortcuts, value: string) => {
+    const shortcuts = conf.data.shortcuts ?? {}
+    const isAlreadyUsed = Object.entries(shortcuts).some(
+      ([key, shortcut]) => key !== field && shortcut?.toLowerCase() === value.toLowerCase(),
+    )
+
+    if (isAlreadyUsed) {
+      toast.error(t`Ce raccourci est déjà utilisé`)
+      return
+    }
+
+    try {
+      await setConf.mutateAsync({
+        ...conf.data,
+        shortcuts: {
+          ...shortcuts,
+          [field]: value,
+        },
+      })
+      await reregisterShortcuts.mutateAsync()
+      toast.success(t`Raccourci mis à jour`)
+    } catch {
+      toast.error(t`Erreur lors de la mise à jour du raccourci`)
+    }
+  }
+
+  return (
+    <Page
+      backButton={<BackButtonLink from={Route.fullPath} hash={hash} search={search} state={state} to={from} />}
+      key="settings-page"
+      title={t`Paramètres`}
+    >
+      <PageScrollableContent className="py-2">
+        <div className="container flex max-w-lg flex-col gap-4 px-2 py-2">
+          <SettingCard id="section-general" title={<Trans>Général</Trans>}>
+            <SettingCardSection id="section-auto-open-guides">
+              <div className="flex items-center justify-between gap-2">
+                <Label className="text-xs" htmlFor="auto-open-guides">
+                  <Trans>Ouvrir les guides à l'ouverture</Trans>
+                </Label>
+                <Switch
+                  checked={conf.data.autoOpenGuides}
+                  id="auto-open-guides"
+                  onCheckedChange={(checked) => {
+                    setConf.mutate({
+                      ...conf.data,
+                      autoOpenGuides: checked,
+                    })
+                  }}
+                />
+              </div>
+            </SettingCardSection>
+            <SettingCardSection id="section-auto-travel-copy">
+              <div className="flex items-center justify-between gap-2">
+                <Label className="text-xs" htmlFor="auto-travel-copy">
+                  <Trans>Copie d'autopilote</Trans>
+                </Label>
+                <Switch
+                  checked={conf.data.autoTravelCopy}
+                  id="auto-travel-copy"
+                  onCheckedChange={(checked) => {
+                    setConf.mutate({
+                      ...conf.data,
+                      autoTravelCopy: checked,
+                    })
+                  }}
+                />
+              </div>
+            </SettingCardSection>
+            <SettingCardSection id="section-double-zaap">
+              <div className="flex items-center justify-between gap-2">
+                <Label className="text-xs" htmlFor="double-zaap">
+                  <Trans>Doubler la commande zaap</Trans>
+                </Label>
+                <Switch
+                  checked={conf.data.doubleZaap ?? true}
+                  id="double-zaap"
+                  onCheckedChange={(checked) => {
+                    setConf.mutate({
+                      ...conf.data,
+                      doubleZaap: checked,
+                    })
+                  }}
+                />
+              </div>
+            </SettingCardSection>
+            <SettingCardSection id="section-show-done-guides">
+              <div className="flex items-center justify-between gap-2">
+                <Label className="text-xs" htmlFor="show-done-guides">
+                  <Trans>Afficher les guides terminés</Trans>
+                </Label>
+                <Switch
+                  checked={conf.data.showDoneGuides}
+                  id="show-done-guides"
+                  onCheckedChange={(checked) => {
+                    setConf.mutate({
+                      ...conf.data,
+                      showDoneGuides: checked,
+                    })
+                  }}
+                />
+              </div>
+            </SettingCardSection>
+          </SettingCard>
+          <SettingCard id="section-appearance" title={<Trans>Apparence</Trans>}>
+            <SettingCardSection id="section-opacity">
+              <Label className="text-xs" htmlFor="opacity">
+                <Trans>Opacité</Trans>
+              </Label>
+              <Slider
+                defaultValue={[conf.data.opacity * 100]}
+                id="opacity"
+                max={98}
+                onValueChange={(v) => {
+                  setOpacity(v[0] / 100)
+                }}
+                step={1}
+              />
+            </SettingCardSection>
+            <SettingCardSection id="section-font-size">
+              <p className="text-xs leading-none font-medium">
+                <Trans>Taille de texte des guides</Trans>
+              </p>
+              <Select
+                onValueChange={(value) => {
+                  setConf.mutate({
+                    ...conf.data,
+                    fontSize: value as FontSize,
+                  })
+                }}
+                value={conf.data.fontSize}
+              >
+                <SelectTrigger className="text-xs" id="lang-guides">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="ExtraSmall">
+                    <Trans>Très petite</Trans>
+                  </SelectItem>
+                  <SelectItem value="Small">
+                    <Trans>Petite</Trans>
+                  </SelectItem>
+                  <SelectItem value="Normal">
+                    <Trans>Normale</Trans>
+                  </SelectItem>
+                  <SelectItem value="Large">
+                    <Trans>Grande</Trans>
+                  </SelectItem>
+                  <SelectItem value="ExtraLarge">
+                    <Trans>Très grande</Trans>
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </SettingCardSection>
+            <SettingCardSection id="section-guide-display">
+              <p className="text-xs leading-none font-medium">
+                <Trans>Taille des onglets de guides</Trans>
+              </p>
+              <Select
+                onValueChange={(value) => {
+                  setConf.mutate({
+                    ...conf.data,
+                    guideDisplay: value as GuideDisplay,
+                  })
+                }}
+                value={conf.data.guideDisplay ?? 'Dynamic'}
+              >
+                <SelectTrigger className="text-xs" id="guide-display">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="Dynamic">
+                    <Trans>Dynamique (selon la fenêtre)</Trans>
+                  </SelectItem>
+                  <SelectItem value="Small">
+                    <Trans>Compact (toujours)</Trans>
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </SettingCardSection>
+            <SettingCardSection id="section-lang">
+              <SelectLangLabel htmlFor="lang-guides" />
+              <SelectLangSelect
+                onValueChange={async (value) => {
+                  setConf.mutate({
+                    ...conf.data,
+                    lang: value as ConfLang,
+                  })
+                }}
+                value={conf.data.lang}
+              />
+            </SettingCardSection>
+            <SettingCardSection id="section-theme">
+              <ThemeSelector />
+            </SettingCardSection>
+          </SettingCard>
+          <SettingCard
+            className="slot-[card-content]:pt-0 slot-[card-description]:text-xs"
+            description={
+              <Trans>
+                Note : Les raccourcis déjà utilisés par d'autres applications (AMD Adrenalin, Nvidia App, etc.) ne
+                peuvent pas être enregistrés. Supprimez-les d'abord dans ces applications.
+              </Trans>
+            }
+            id="section-shortcuts"
+            title={<Trans>Raccourcis clavier</Trans>}
+          >
+            <SettingCardSection id="section-shortcuts-inputs">
+              <ShortcutInput
+                description={t`Efface tous vos profils et paramètres (pas les guides)`}
+                id="reset-conf"
+                label={t`Réinitialiser la configuration`}
+                onChange={(value) => updateShortcut('resetConf', value)}
+                value={conf.data.shortcuts?.resetConf}
+              />
+              <ShortcutInput
+                id="go-previous-step"
+                label={t`Étape précédente`}
+                onChange={(value) => updateShortcut('goPreviousStep', value)}
+                value={conf.data.shortcuts?.goPreviousStep}
+              />
+              <ShortcutInput
+                id="go-next-step"
+                label={t`Étape suivante`}
+                onChange={(value) => updateShortcut('goNextStep', value)}
+                value={conf.data.shortcuts?.goNextStep}
+              />
+              <ShortcutInput
+                id="copy-current-step"
+                label={t`Copier l'étape actuelle`}
+                onChange={(value) => updateShortcut('copyCurrentStep', value)}
+                value={conf.data.shortcuts?.copyCurrentStep}
+              />
+            </SettingCardSection>
+          </SettingCard>
+          <SettingCard id="section-profiles-card" title={<Trans>Profils</Trans>}>
+            <SettingCardSection id="section-profiles">
+              <div className="w-full">
+                <Profiles />
+              </div>
+            </SettingCardSection>
+            <SettingCardSection id="section-create-profile">
+              <Label className="text-xs" htmlFor="create-profile">
+                <Trans>Créer un profil</Trans>
+              </Label>
+              <form
+                className="flex flex-col gap-2"
+                onSubmit={async (evt) => {
+                  evt.preventDefault()
+                  const form = evt.currentTarget
+
+                  const profileName = form.newProfile.value as string
+
+                  // Check if the profile name is not empty and if it doesn't already exist
+                  if (profileName.trim() !== '' && !conf.data.profiles.find((p) => p.name === profileName.trim())) {
+                    const id = await newId.mutateAsync()
+
+                    const trimmedName = profileName.trim()
+
+                    const newConf = {
+                      ...conf.data,
+                      profiles: [
+                        ...conf.data.profiles,
+                        {
+                          id,
+                          name: trimmedName,
+                          progresses: [],
+                        },
+                      ],
+                      profileInUse: id,
+                    }
+
+                    await setConf.mutateAsync(newConf)
+                    await switchProfile(newConf, id)
+
+                    createProfileRemote(trimmedName, id).then((result) => {
+                      if (result.isOk()) {
+                        const serverId = result.value
+                        const currentConf = queryClient.getQueryData(confQuery.queryKey)
+                        if (currentConf) {
+                          setConf.mutate({
+                            ...currentConf,
+                            profiles: currentConf.profiles.map((p) =>
+                              p.id === id ? { ...p, server_id: serverId } : p,
+                            ),
+                          })
+                        }
+                      }
+                    })
+
+                    toast.success(t`Profil créé avec succès`)
+
+                    form.newProfile.value = ''
+                  } else {
+                    toast.error(t`Erreur lors de la création du profil. Vérifiez le nom du profil (nom unique).`)
+                  }
+                }}
+              >
+                <Input className="h-9" id="create-profile" name="newProfile" />
+                <Button className="self-start" type="submit">
+                  <span>
+                    <Trans>Créer</Trans>
+                  </span>
+                  {newId.isError && <TriangleAlertIcon className="text-red-500" />}
+                </Button>
+              </form>
+            </SettingCardSection>
+          </SettingCard>
+        </div>
+      </PageScrollableContent>
+    </Page>
+  )
+}

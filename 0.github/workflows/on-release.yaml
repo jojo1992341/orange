@@ -1,0 +1,139 @@
+name: 'on-release'
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - closed
+
+jobs:
+  publish-tauri:
+    if: startsWith(github.head_ref, 'changeset-release')
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'macos-latest' # for Arm based macs (M1 and above).
+#            args: '--target aarch64-apple-darwin'
+            args: '--target universal-apple-darwin'
+#          - platform: 'macos-latest' # for Intel based macs.
+#            args: '--target x86_64-apple-darwin'
+          - platform: 'windows-latest'
+            args: ''
+          - platform: 'ubuntu-24.04'
+            args: ''
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: 'pnpm'
+          cache-dependency-path: 'pnpm-lock.yaml'
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Those targets are only used on macOS runners so it's in an `if` to slightly speed up windows and linux builds.
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt install -y \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libgtk-3-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libfuse2t64;
+
+          sudo apt install -y \
+            libwebkit2gtk-4.1-0 \
+            libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-0 \
+            libjavascriptcoregtk-4.1-dev \
+            gir1.2-javascriptcoregtk-4.1 \
+            gir1.2-webkit2-4.1;
+
+      - name: setup cache
+        uses: actions/cache@v4
+        with:
+          key: ${{ runner.os }}-tauri-${{ hashFiles('src-tauri/Cargo.lock', 'src-tauri/Cargo.toml', 'src-tauri/target/release') }}
+          restore-keys: |
+            ${{ runner.os }}-tauri-
+          path: |
+            ~/.cargo
+            src-tauri/target/release/build
+            src-tauri/target/release/.fingerprint
+            src-tauri/target/release/deps
+            src-tauri/target/release/examples
+            src-tauri/target/release/incremental
+            src-tauri/target/release/nsis
+            src-tauri/target/release/resources
+            src-tauri/target/release/.cargo-lock
+
+      - name: install frontend dependencies
+        run: pnpm i --frozen-lockfile
+
+      - uses: tauri-apps/tauri-action@v0
+        id: tauri
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          GANYMEDE_API: ${{ secrets.GANYMEDE_API }}
+          GANYMEDE_API_KEY: ${{ secrets.GANYMEDE_API_KEY }}
+          GANYMEDE_WEBSITE: ${{ secrets.GANYMEDE_WEBSITE }}
+          GANYMEDE_CLIENT_ID: ${{ secrets.GANYMEDE_CLIENT_ID }}
+        with:
+          tauriScript: ${{ startsWith(matrix.platform, 'ubuntu-') && 'bash scripts/tauri-build.sh' || '' }}
+          tagName: __VERSION__ # the action automatically replaces \_\_VERSION\_\_ with the app version.
+          releaseName: '__VERSION__'
+          releaseBody: 'See the assets to download this version and install.'
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+      - name: copy setup (windows)
+        if: matrix.platform == 'windows-latest'
+        run: |
+            $file = Get-ChildItem src-tauri/target/release/bundle/nsis/ -Filter Ganymede_*_x64-setup.exe | Select-Object -First 1 -Expand FullName
+            $setup = [string]::Join("", ((Get-ChildItem src-tauri/target/release/bundle/ -Recurse).fullname | Select-Object -First 1), "\Ganymede_x64-setup.exe")
+            Copy-Item $file $setup
+            Write-Host $file
+            Write-Host $setup
+            Write-Host (Get-ChildItem src-tauri/target/release/bundle/ -Recurse).fullname
+      - name: copy AppImage (linux)
+        if: runner.os == 'Linux'
+        run: |
+            cd src-tauri/target/release/bundle/appimage
+            cp "$(ls Ganymede_*_amd64.AppImage | sed -E 's/\*//')" "$(ls Ganymede_*_amd64.AppImage | sed -E 's/Ganymede_.*_amd64\.AppImage/Ganymede_amd64.AppImage/' | sed -E 's/\*//')"
+      - uses: softprops/action-gh-release@v2
+        name: upload artifacts
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.tauri.outputs.appVersion }}
+          draft: true
+          files: |
+            src-tauri/target/release/bundle/nsis/Ganymede_x64-setup.exe
+            src-tauri/target/release/bundle/appimage/Ganymede_amd64.AppImage
+      - name: Upload debug informations to Sentry (windows)
+        if: matrix.platform == 'windows-latest'
+        run: |
+          pnpm sentry-cli debug-files bundle-sources src-tauri/target/release/ganymede.pdb
+          pnpm sentry-cli debug-files upload --auth-token=${{ secrets.SENTRY_AUTH_TOKEN }} src-tauri/target/release/ganymede.pdb src-tauri/target/release/ganymede.src.zip

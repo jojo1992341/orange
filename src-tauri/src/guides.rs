@@ -1,0 +1,2242 @@
+use std::{
+    collections::{HashMap, HashSet},
+    fmt, fs,
+    path::{Path, PathBuf},
+    vec,
+};
+
+use log::{debug, info, warn};
+use serde::{Deserialize, Serialize};
+use tauri::{AppHandle, Manager, Runtime, Wry};
+use tauri_plugin_http::reqwest;
+use tauri_plugin_opener::OpenerExt;
+
+use crate::{api::GANYMEDE_API, tauri_api_ext::GuidesPathExt};
+
+pub const DEFAULT_GUIDE_ID: u32 = 1074;
+const MAX_RECENT_GUIDES: usize = 50;
+/// Extension appended to quarantine a malformed guide file. Renaming (instead of
+/// deleting) preserves the data while excluding it from scans, since it no longer
+/// ends with `.json`. See issues #200 and #209.
+const CORRUPTED_GUIDE_SUFFIX: &str = "corrupted";
+
+/// Local guides (created or duplicated from the edition mode) use ids above this
+/// bound so they can never collide with an id served by the API.
+const LOCAL_GUIDE_ID_BASE: u32 = 2_000_000_000;
+
+/// Extension of the pristine copy kept next to a guide file before its first local
+/// edit. It ends with `.bak` and not `.json`, so the guides scan ignores it.
+const LOCAL_EDIT_BACKUP_EXTENSION: &str = "json.bak";
+
+// ================================================================================================
+// Enums
+// ================================================================================================
+
+#[derive(Debug, Clone, Serialize, thiserror::Error, taurpc::specta::Type)]
+#[specta(rename = "GuidesError")]
+pub enum Error {
+    #[error("cannot parse glob pattern: {0}")]
+    Pattern(String),
+    #[error("cannot read the guides directory glob: {0}")]
+    ReadGuidesDirGlob(String),
+    #[error("cannot read a guide file: {0}")]
+    ReadGuideFile(String),
+    #[error("cannot read a recent guides file: {0}")]
+    ReadRecentGuidesFile(String),
+    #[error("malformed guide: {0}")]
+    GuideMalformed(#[from] crate::json::Error),
+    #[error("guide not found: {0}")]
+    GuideNotFound(u32),
+    #[error("malformed recent guides file: {0}")]
+    RecentGuidesFileMalformed(String),
+    #[error("cannot serialize guide: {0}")]
+    SerializeGuide(crate::json::Error),
+    #[error("cannot serialize recent guides file: {0}")]
+    SerializeRecentGuidesFile(crate::json::Error),
+    #[error("cannot create the guides directory: {0}")]
+    CreateGuidesDir(String),
+    #[error("cannot write a guide file: {0}")]
+    WriteGuideFile(String),
+    #[error("cannot write recent guides file: {0}")]
+    WriteRecentGuidesFile(String),
+    #[error("cannot request a guide from server: {0}")]
+    RequestGuide(String),
+    #[error("cannot get the content of a guide request: {0}")]
+    RequestGuideContent(String),
+    #[error("cannot request guides from server: {0}")]
+    RequestGuides(String),
+    #[error("cannot get the content of a guides request: {0}")]
+    RequestGuidesContent(String),
+    #[error("malformed guide with steps: {0}")]
+    GuideWithStepsMalformed(crate::json::Error),
+    #[error("malformed guides: {0}")]
+    GuidesMalformed(crate::json::Error),
+    #[error("cannot read the guides directory: {0}")]
+    ReadGuidesDir(String),
+    #[error("cannot get guide in system: {0}")]
+    GetGuideInSystem(u32),
+    #[error("cannot delete guide file in system: {0}")]
+    DeleteGuideFileInSystem(String),
+    #[error("cannot delete guide folder in system: {0}")]
+    DeleteGuideFolderInSystem(String),
+    #[error("error in opener plugin")]
+    Opener(String),
+    #[error("server unreachable")]
+    NetworkUnavailable,
+    #[error("guide was not downloaded from the server: {0}")]
+    GuideNotFromServer(u32),
+    #[error("cannot backup a guide file: {0}")]
+    BackupGuideFile(String),
+    #[error("cannot create a guide folder: {0}")]
+    CreateGuideFolder(String),
+}
+
+#[derive(Serialize, Deserialize, Clone, taurpc::specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum GuideLang {
+    En,
+    Fr,
+    Es,
+    Pt,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, Clone, taurpc::specta::Type)]
+#[serde(rename_all = "lowercase")]
+pub enum GameType {
+    #[default]
+    Dofus,
+    Wakfu,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, taurpc::specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum Status {
+    Draft,
+    Public,
+    Private,
+    Certified,
+    Gp,
+}
+
+#[derive(Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Clone, taurpc::specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub enum SummaryQuestStatus {
+    Setup(u32),
+    Started(u32),
+    InProgress(u32),
+    Completed(u32),
+}
+
+#[derive(Serialize, Deserialize, Clone, taurpc::specta::Type)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum GuidesOrFolder {
+    Guide(GuideWithSteps),
+    Folder(Folder),
+}
+
+#[derive(Serialize, Clone, taurpc::specta::Type)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum UpdateAllAtOnceResult {
+    Success,
+    Failure { message: String },
+    Offline,
+    /// The guide has local modifications and is protected from server updates.
+    Skipped,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, taurpc::specta::Type)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum GuideOrFolderToDelete {
+    Guide { id: u32, folder: Option<String> },
+    Folder { folder: String },
+}
+
+// ================================================================================================
+// Structs
+// ================================================================================================
+
+#[taurpc::ipc_type]
+#[specta(rename = "GuideUser")]
+pub struct User {
+    pub id: u32,
+    pub name: String,
+    pub is_admin: u8,
+    pub is_certified: u8,
+}
+
+#[taurpc::ipc_type]
+pub struct GuideStep {
+    pub name: Option<String>,
+    pub map: Option<String>,
+    pub pos_x: i32,
+    pub pos_y: i32,
+    pub web_text: String,
+}
+
+#[taurpc::ipc_type]
+pub struct Guide {
+    pub id: u32,
+    pub name: String,
+    pub status: Status,
+    pub likes: u32,
+    pub dislikes: u32,
+    pub downloads: Option<u32>,
+    pub created_at: String,
+    pub deleted_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub lang: GuideLang,
+    #[serde(default)]
+    pub game_type: GameType,
+    pub order: u32,
+    pub user: User,
+    pub user_id: u32,
+    pub description: Option<String>,
+    pub web_description: Option<String>,
+    pub node_image: Option<String>,
+}
+
+#[taurpc::ipc_type]
+pub struct GuideWithSteps {
+    pub id: u32,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: Status,
+    pub likes: u32,
+    pub dislikes: u32,
+    pub downloads: Option<u32>,
+    pub deleted_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub lang: GuideLang,
+    #[serde(default)]
+    pub game_type: GameType,
+    pub order: u32,
+    pub user: User,
+    pub web_description: Option<String>,
+    pub node_image: Option<String>,
+    pub steps: Vec<GuideStep>,
+    /// Set when the guide was modified locally through the edition mode. A guide
+    /// carrying it is never overwritten by a server update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_edit: Option<LocalEdit>,
+    #[serde(skip_deserializing, serialize_with = "crate::json::serialize_path")]
+    pub folder: Option<PathBuf>,
+}
+
+/// Marker stored in a guide file when the user edited it locally.
+#[derive(Debug, Default, Serialize, Deserialize, Clone, taurpc::specta::Type)]
+pub struct LocalEdit {
+    /// RFC 3339 timestamp of the last local save.
+    pub edited_at: String,
+    /// `updated_at` of the server version this local copy derives from. `None` for
+    /// guides that were created or duplicated inside the app.
+    pub based_on: Option<String>,
+}
+
+#[derive(Default)]
+#[taurpc::ipc_type]
+#[serde(rename_all = "camelCase")]
+pub struct Guides {
+    pub guides: Vec<GuideWithSteps>,
+}
+
+#[derive(Serialize, Deserialize, Clone, taurpc::specta::Type)]
+#[serde(rename_all = "camelCase")]
+pub struct Folder {
+    pub name: String,
+}
+
+#[taurpc::ipc_type]
+pub struct QuarantinedGuideFile {
+    pub id: Option<u32>,
+    pub file_name: String,
+}
+
+#[derive(Debug)]
+#[taurpc::ipc_type]
+#[serde(rename_all = "camelCase")]
+pub struct Summary {
+    pub quests: Vec<QuestSummary>,
+}
+
+#[derive(Debug)]
+#[taurpc::ipc_type]
+#[serde(rename_all = "camelCase")]
+pub struct QuestSummary {
+    pub name: String,
+    pub statuses: Vec<SummaryQuestStatus>,
+}
+
+pub type RecentGuides = HashMap<String, Vec<u32>>;
+type LastFocusedGuides = HashMap<String, u32>;
+
+#[derive(Deserialize)]
+struct BatchGuideResponse {
+    data: Vec<GuideWithSteps>,
+}
+
+// ================================================================================================
+// Type Implementations
+// ================================================================================================
+
+impl Status {
+    fn to_str(&self) -> &'static str {
+        use Status::*;
+
+        match self {
+            Draft => "draft",
+            Public => "public",
+            Private => "private",
+            Certified => "certified",
+            Gp => "gp",
+        }
+    }
+}
+
+impl Into<String> for Status {
+    fn into(self) -> String {
+        self.to_string()
+    }
+}
+
+impl fmt::Display for Status {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.to_str().to_string())
+    }
+}
+
+// ================================================================================================
+// Public Functions
+// ================================================================================================
+
+/// Ensure the guides directory exists
+pub fn ensure_guides_dir(app_handle: &AppHandle) -> Result<(), Error> {
+    let guides_dir = &app_handle.path().app_guides_dir();
+
+    if !guides_dir.exists() {
+        fs::create_dir_all(guides_dir).map_err(|err| Error::CreateGuidesDir(err.to_string()))?;
+    }
+
+    Ok(())
+}
+
+/// Download the default guide (tutorial guide) into the guides directory
+pub async fn download_default_guide(app: &AppHandle) -> Result<Guides, Error> {
+    let mut guides = get_guides_from_handle(app, "".into())?;
+
+    download_guide_by_id(app, &mut guides, DEFAULT_GUIDE_ID, "".into()).await?;
+
+    write_guides(&guides, app)?;
+
+    Ok(guides)
+}
+
+/// Update all guides at app launch (non-blocking)
+pub async fn update_all_guides_at_launch(app: &AppHandle) {
+    info!("[Guides] update_all_guides_at_launch");
+
+    match update_all_guides_batch(app).await {
+        Ok(results) => {
+            let success_count = results
+                .values()
+                .filter(|r| matches!(r, UpdateAllAtOnceResult::Success))
+                .count();
+            let total_count = results.len();
+            info!(
+                "[Guides] update_all_guides_at_launch: {}/{} guides updated",
+                success_count, total_count
+            );
+        }
+        Err(err) => {
+            warn!("[Guides] update_all_guides_at_launch failed: {}", err);
+        }
+    }
+
+    // The frontend boots while this runs, so it has to be told when the guides on disk
+    // changed, most notably the ones recovered from quarantine. See issue #223.
+    if let Err(err) = GuidesEventTrigger::new(app.clone()).guides_updated_at_launch::<Wry>() {
+        warn!(
+            "[Guides] failed to emit the guides_updated_at_launch event: {}",
+            err
+        );
+    }
+}
+
+/// Fetch a guide from the server by its ID
+pub async fn get_guide_from_server(
+    guide_id: u32,
+    http_client: &reqwest::Client,
+) -> Result<GuideWithSteps, Error> {
+    info!("[Guides] get_guide_from_server: {}", guide_id);
+
+    let res = http_client
+        .get(format!("{}/v2/guides/{}", GANYMEDE_API, guide_id))
+        .send()
+        .await
+        .map_err(|err| Error::RequestGuide(err.to_string()))?;
+    let text = res
+        .text()
+        .await
+        .map_err(|err| Error::RequestGuideContent(err.to_string()))?;
+
+    let mut guide = crate::json::from_str::<GuideWithSteps>(text.as_str())
+        .map_err(Error::GuideWithStepsMalformed)?;
+
+    guide.folder = None;
+
+    Ok(guide)
+}
+
+/// Fetch multiple guides from the server by their IDs in a single batch request
+pub async fn get_guides_from_server(
+    ids: Vec<u32>,
+    http_client: &reqwest::Client,
+) -> Vec<Result<GuideWithSteps, Error>> {
+    info!("[Guides] get_guides_from_server (batch): {:?}", ids);
+
+    let joined_ids = ids
+        .iter()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let res = http_client
+        .get(format!(
+            "{}/v2/guides/batch?ids={}",
+            GANYMEDE_API, joined_ids
+        ))
+        .send()
+        .await;
+
+    let response = match res {
+        Ok(response) => response,
+        Err(err) => {
+            let error = if err.is_connect() || err.is_timeout() {
+                Error::NetworkUnavailable
+            } else {
+                Error::RequestGuides(err.to_string())
+            };
+            return ids.iter().map(|_| Err(error.clone())).collect();
+        }
+    };
+
+    let text = match response.text().await {
+        Ok(text) => text,
+        Err(err) => {
+            let error = Error::RequestGuidesContent(err.to_string());
+            return ids.iter().map(|_| Err(error.clone())).collect();
+        }
+    };
+
+    let batch_response = match crate::json::from_str::<BatchGuideResponse>(text.as_str()) {
+        Ok(batch) => batch,
+        Err(err) => {
+            let error = Error::GuidesMalformed(err);
+            return ids.iter().map(|_| Err(error.clone())).collect();
+        }
+    };
+
+    let mut guides_map: HashMap<u32, GuideWithSteps> = HashMap::new();
+    for mut guide in batch_response.data {
+        guide.folder = None;
+        guides_map.insert(guide.id, guide);
+    }
+
+    ids.iter()
+        .map(|id| {
+            guides_map
+                .remove(id)
+                .ok_or_else(|| Error::GuideNotFound(*id))
+        })
+        .collect()
+}
+
+// ================================================================================================
+// Private Functions
+// ================================================================================================
+
+fn get_guides_or_folder_from_handle<R: Runtime>(
+    app: &AppHandle<R>,
+    folder: Option<String>,
+) -> Result<Vec<GuidesOrFolder>, Error> {
+    let mut guide_folder = app.path().app_guides_dir();
+
+    if let Some(folder) = folder {
+        guide_folder = guide_folder.join(folder);
+    }
+
+    println!("[Guides] get_guides_or_folder in {:?}", guide_folder);
+
+    let mut result = vec![];
+
+    for entry in fs::read_dir(guide_folder).map_err(|err| Error::ReadGuidesDir(err.to_string()))? {
+        let entry = entry.map_err(|err| Error::ReadGuidesDir(err.to_string()))?;
+        let path = entry.path();
+        let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
+
+        if path.is_dir() {
+            result.push(GuidesOrFolder::Folder(Folder { name: file_name }));
+        } else if path.is_file() {
+            if let Some(ext) = path.extension() {
+                if ext == "json" {
+                    if let Some(guide) = parse_guide_or_quarantine(&path)? {
+                        result.push(GuidesOrFolder::Guide(guide));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Parse a guide file. On a JSON parse error (e.g. empty or corrupted file), the
+/// file is quarantined by renaming it with a `.corrupted` suffix so a single
+/// malformed guide does not break loading the whole list. Quarantined files are
+/// skipped by later scans and surfaced through `list_corrupted_guides`, which
+/// powers the toast letting the user delete them. See issues #200 and #209.
+fn parse_guide_or_quarantine(file_path: &Path) -> Result<Option<GuideWithSteps>, Error> {
+    let content =
+        fs::read_to_string(file_path).map_err(|err| Error::ReadGuideFile(err.to_string()))?;
+
+    match crate::json::from_str::<GuideWithSteps>(content.as_str()) {
+        Ok(mut guide) => {
+            guide.folder = Some(file_path.parent().unwrap().to_path_buf());
+            Ok(Some(guide))
+        }
+        Err(err) => {
+            warn!(
+                "[Guides] quarantining malformed guide file {:?}: {}",
+                file_path, err
+            );
+
+            let mut quarantine_name = file_path.file_name().unwrap_or_default().to_os_string();
+            quarantine_name.push(".");
+            quarantine_name.push(CORRUPTED_GUIDE_SUFFIX);
+            let quarantine_path = file_path.with_file_name(quarantine_name);
+
+            if let Err(rename_err) = fs::rename(file_path, &quarantine_path) {
+                warn!(
+                    "[Guides] failed to quarantine malformed guide file {:?}: {}",
+                    file_path, rename_err
+                );
+            }
+
+            Ok(None)
+        }
+    }
+}
+
+/// List the quarantined `*.corrupted` files still present under a guides directory.
+fn find_quarantined_guide_files(guides_dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let options = glob::MatchOptions {
+        case_sensitive: false,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+
+    let pattern = format!("**/*.{}", CORRUPTED_GUIDE_SUFFIX);
+    let files = glob::glob_with(guides_dir.join(pattern).to_str().unwrap(), options)
+        .map_err(|err| Error::Pattern(err.to_string()))?;
+
+    let mut quarantined = vec![];
+
+    for entry in files {
+        let file_path = entry.map_err(|err| Error::ReadGuidesDirGlob(err.to_string()))?;
+
+        if file_path.is_file() {
+            quarantined.push(file_path);
+        }
+    }
+
+    Ok(quarantined)
+}
+
+/// Strip the quarantine suffix to recover the original name (e.g. `42.json`).
+fn quarantined_guide_file_name(file_path: &Path) -> String {
+    let suffix = format!(".{}", CORRUPTED_GUIDE_SUFFIX);
+    let file_name = file_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+
+    file_name
+        .strip_suffix(&suffix)
+        .unwrap_or(file_name)
+        .to_string()
+}
+
+/// Guide id of a quarantined file, when its name is still a plain `{id}.json`.
+fn quarantined_guide_id(file_path: &Path) -> Option<u32> {
+    Path::new(&quarantined_guide_file_name(file_path))
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.parse::<u32>().ok())
+}
+
+/// Scan all guides (quarantining any newly malformed one) then list the
+/// quarantined `*.corrupted` files still present on disk. Pull-based so the toast
+/// is reliably shown on startup, unlike a fire-and-forget event that can be
+/// emitted before the frontend listener is registered. See issue #209.
+fn list_corrupted_guides<R: Runtime>(
+    app_handle: &AppHandle<R>,
+) -> Result<Vec<QuarantinedGuideFile>, Error> {
+    // A full scan quarantines any malformed guide before we list the results.
+    get_guides_from_handle(app_handle, "".to_string())?;
+
+    let guides_dir = app_handle.path().app_guides_dir();
+
+    let corrupted = find_quarantined_guide_files(&guides_dir)?
+        .iter()
+        .map(|file_path| QuarantinedGuideFile {
+            id: quarantined_guide_id(file_path),
+            file_name: quarantined_guide_file_name(file_path),
+        })
+        .collect();
+
+    Ok(corrupted)
+}
+
+/// Delete all quarantined guide files (`*.corrupted`) under the guides directory.
+/// Triggered by the "delete" action of the malformed guides toast. See issue #209.
+fn delete_corrupted_guides<R: Runtime>(app_handle: &AppHandle<R>) -> Result<(), Error> {
+    let guides_dir = app_handle.path().app_guides_dir();
+
+    info!(
+        "[Guides] deleting quarantined guide files in {:?}",
+        guides_dir
+    );
+
+    for file_path in find_quarantined_guide_files(&guides_dir)? {
+        info!("[Guides] deleting quarantined guide file {:?}", file_path);
+
+        fs::remove_file(&file_path)
+            .map_err(|err| Error::DeleteGuideFileInSystem(err.to_string()))?;
+    }
+
+    Ok(())
+}
+
+fn get_guides_from_path(path_buf: &PathBuf) -> Result<Guides, Error> {
+    info!("[Guides] get_guides in {:?}", path_buf);
+
+    let options = glob::MatchOptions {
+        case_sensitive: false,
+        require_literal_separator: false,
+        require_literal_leading_dot: false,
+    };
+
+    let files = glob::glob_with(path_buf.join("**/*.json").to_str().unwrap(), options)
+        .map_err(|err| Error::Pattern(err.to_string()))?;
+
+    let mut guides = vec![];
+
+    for entry in files {
+        let file_path = entry.map_err(|err| Error::ReadGuidesDirGlob(err.to_string()))?;
+
+        let Some(guide) = parse_guide_or_quarantine(&file_path)? else {
+            continue;
+        };
+
+        if guides.iter().any(|g: &GuideWithSteps| g.id == guide.id) {
+            continue;
+        }
+
+        guides.push(guide);
+    }
+
+    Ok(Guides { guides })
+}
+
+fn get_guides_from_handle<R: Runtime>(app: &AppHandle<R>, folder: String) -> Result<Guides, Error> {
+    let mut guides_dir = app.path().app_guides_dir();
+
+    if folder != "" {
+        guides_dir = guides_dir.join(folder);
+    }
+
+    get_guides_from_path(&guides_dir)
+}
+
+fn write_guides<R: Runtime>(guides: &Guides, app: &AppHandle<R>) -> Result<(), Error> {
+    let guides_dir = &app.path().app_guides_dir();
+
+    for guide in &guides.guides {
+        let json = crate::json::serialize_pretty(guide).map_err(Error::SerializeGuide)?;
+
+        if !guides_dir.exists() {
+            fs::create_dir_all(guides_dir)
+                .map_err(|err| Error::CreateGuidesDir(err.to_string()))?;
+        }
+
+        let file = guide
+            .folder
+            .as_ref()
+            .unwrap_or(guides_dir)
+            .join(format!("{}.json", guide.id));
+
+        debug!("Writing guide to {:?}", file);
+
+        fs::write(file.as_path(), json).map_err(|err| Error::WriteGuideFile(err.to_string()))?;
+    }
+
+    Ok(())
+}
+
+/// Path of the file backing a guide: its own folder when it lives in a sub folder,
+/// otherwise the guides root.
+fn guide_file_path(guide: &GuideWithSteps, guides_dir: &Path) -> PathBuf {
+    guide
+        .folder
+        .as_deref()
+        .unwrap_or(guides_dir)
+        .join(format!("{}.json", guide.id))
+}
+
+/// Pristine copy kept next to a guide file before its first local edit.
+fn guide_backup_path(file_path: &Path) -> PathBuf {
+    file_path.with_extension(LOCAL_EDIT_BACKUP_EXTENSION)
+}
+
+fn write_guide_file(guide: &GuideWithSteps, file_path: &Path) -> Result<(), Error> {
+    let json = crate::json::serialize_pretty(guide).map_err(Error::SerializeGuide)?;
+
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent).map_err(|err| Error::CreateGuideFolder(err.to_string()))?;
+    }
+
+    debug!("[Guides] writing guide to {:?}", file_path);
+
+    fs::write(file_path, json).map_err(|err| Error::WriteGuideFile(err.to_string()))
+}
+
+/// Write a guide modified locally, keeping the version the edition started from in a
+/// `.bak` file next to it. The backup is written once, so later saves still allow the
+/// user to restore the original content.
+fn write_guide_locally(guide: &GuideWithSteps, guides_dir: &Path) -> Result<(), Error> {
+    let file_path = guide_file_path(guide, guides_dir);
+    let backup_path = guide_backup_path(&file_path);
+
+    if file_path.exists() && !backup_path.exists() {
+        info!("[Guides] backing up {:?} to {:?}", file_path, backup_path);
+
+        fs::copy(&file_path, &backup_path)
+            .map_err(|err| Error::BackupGuideFile(err.to_string()))?;
+    }
+
+    write_guide_file(guide, &file_path)
+}
+
+/// Next free id for a guide created inside the app. Local ids start at
+/// `LOCAL_GUIDE_ID_BASE` so they never collide with server ids.
+fn next_local_guide_id(guides: &Guides) -> u32 {
+    guides
+        .guides
+        .iter()
+        .map(|guide| guide.id)
+        .filter(|id| *id >= LOCAL_GUIDE_ID_BASE)
+        .max()
+        .map(|id| id.saturating_add(1))
+        .unwrap_or(LOCAL_GUIDE_ID_BASE)
+}
+
+fn local_guide_author() -> User {
+    User {
+        id: 0,
+        name: "Guide personnel".to_string(),
+        is_admin: 0,
+        is_certified: 0,
+    }
+}
+
+fn trimmed_or(value: &str, fallback: &str) -> String {
+    let value = value.trim();
+
+    if value.is_empty() {
+        fallback.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Save the name and the whole step list of a guide, marking it as locally edited so
+/// the next server update leaves it untouched.
+fn save_guide_locally<R: Runtime>(
+    app: &AppHandle<R>,
+    guide_id: u32,
+    name: String,
+    steps: Vec<GuideStep>,
+) -> Result<GuideWithSteps, Error> {
+    info!("[Guides] save_guide_locally: {}", guide_id);
+
+    let guides_dir = app.path().app_guides_dir();
+    let mut guides = get_guides_from_handle(app, "".to_string())?;
+
+    let guide = guides
+        .guides
+        .iter_mut()
+        .find(|guide| guide.id == guide_id)
+        .ok_or(Error::GuideNotFound(guide_id))?;
+
+    let trimmed_name = name.trim();
+
+    if !trimmed_name.is_empty() {
+        guide.name = trimmed_name.to_string();
+    }
+
+    // Keep the server version the local copy derives from, so the user can always tell
+    // what "restore the original" would bring back.
+    let based_on = guide
+        .local_edit
+        .as_ref()
+        .and_then(|edit| edit.based_on.clone())
+        .or_else(|| guide.updated_at.clone());
+
+    guide.steps = steps;
+    guide.local_edit = Some(LocalEdit {
+        edited_at: chrono::Utc::now().to_rfc3339(),
+        based_on,
+    });
+
+    let saved = guide.clone();
+
+    write_guide_locally(&saved, &guides_dir)?;
+
+    Ok(saved)
+}
+
+/// Create an empty local guide in the given folder (guides root when empty).
+fn create_guide_locally<R: Runtime>(
+    app: &AppHandle<R>,
+    name: String,
+    folder: String,
+) -> Result<GuideWithSteps, Error> {
+    let guides_dir = app.path().app_guides_dir();
+    let guides = get_guides_from_handle(app, "".to_string())?;
+
+    let folder = folder.trim();
+    let target_folder = if folder.is_empty() {
+        guides_dir.clone()
+    } else {
+        guides_dir.join(folder)
+    };
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let guide = GuideWithSteps {
+        id: next_local_guide_id(&guides),
+        name: trimmed_or(&name, "Mon guide"),
+        description: None,
+        status: Status::Private,
+        likes: 0,
+        dislikes: 0,
+        downloads: None,
+        deleted_at: None,
+        updated_at: Some(now.clone()),
+        lang: GuideLang::Fr,
+        game_type: GameType::Dofus,
+        order: 0,
+        user: local_guide_author(),
+        web_description: None,
+        node_image: None,
+        steps: vec![GuideStep {
+            name: Some("Étape 1".to_string()),
+            map: None,
+            pos_x: 0,
+            pos_y: 0,
+            web_text: String::new(),
+        }],
+        local_edit: Some(LocalEdit {
+            edited_at: now,
+            based_on: None,
+        }),
+        folder: Some(target_folder),
+    };
+
+    info!("[Guides] create_local_guide: {} in {:?}", guide.id, guide.folder);
+
+    write_guide_locally(&guide, &guides_dir)?;
+
+    Ok(guide)
+}
+
+/// Copy a guide, its steps included, into a new local guide.
+fn duplicate_guide_locally<R: Runtime>(
+    app: &AppHandle<R>,
+    guide_id: u32,
+) -> Result<GuideWithSteps, Error> {
+    let guides_dir = app.path().app_guides_dir();
+    let guides = get_guides_from_handle(app, "".to_string())?;
+
+    let source = guides
+        .guides
+        .iter()
+        .find(|guide| guide.id == guide_id)
+        .cloned()
+        .ok_or(Error::GuideNotFound(guide_id))?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let copy = GuideWithSteps {
+        id: next_local_guide_id(&guides),
+        name: format!("{} (copie)", source.name),
+        description: source.description.clone(),
+        status: Status::Private,
+        likes: 0,
+        dislikes: 0,
+        downloads: None,
+        deleted_at: None,
+        updated_at: Some(now.clone()),
+        lang: source.lang.clone(),
+        game_type: source.game_type.clone(),
+        order: source.order,
+        user: source.user.clone(),
+        web_description: source.web_description.clone(),
+        node_image: source.node_image.clone(),
+        steps: source.steps.clone(),
+        local_edit: Some(LocalEdit {
+            edited_at: now,
+            based_on: None,
+        }),
+        folder: source.folder.clone().or(Some(guides_dir.clone())),
+    };
+
+    info!("[Guides] duplicate_guide_locally: {} -> {}", guide_id, copy.id);
+
+    write_guide_locally(&copy, &guides_dir)?;
+
+    Ok(copy)
+}
+
+/// Drop every local modification of a guide by downloading the server version again.
+async fn revert_guide_locally_to_server<R: Runtime>(
+    app: &AppHandle<R>,
+    guide_id: u32,
+) -> Result<GuideWithSteps, Error> {
+    info!("[Guides] revert_guide_to_server: {}", guide_id);
+
+    if guide_id >= LOCAL_GUIDE_ID_BASE {
+        return Err(Error::GuideNotFromServer(guide_id));
+    }
+
+    let guides_dir = app.path().app_guides_dir();
+    let guides = get_guides_from_handle(app, "".to_string())?;
+
+    let existing = guides
+        .guides
+        .iter()
+        .find(|guide| guide.id == guide_id)
+        .cloned()
+        .ok_or(Error::GuideNotFound(guide_id))?;
+
+    let http_client = app.state::<reqwest::Client>();
+    let mut guide = get_guide_from_server(guide_id, &http_client).await?;
+
+    guide.folder = existing.folder.or(Some(guides_dir.clone()));
+    guide.local_edit = None;
+
+    let file_path = guide_file_path(&guide, &guides_dir);
+
+    write_guide_file(&guide, &file_path)?;
+
+    let backup_path = guide_backup_path(&file_path);
+
+    if backup_path.exists() {
+        if let Err(err) = fs::remove_file(&backup_path) {
+            warn!(
+                "[Guides] cannot delete the local edit backup {:?}: {}",
+                backup_path, err
+            );
+        }
+    }
+
+    Ok(guide)
+}
+
+fn add_or_replace_guide(guides: &mut Guides, guide: GuideWithSteps) -> Result<(), Error> {
+    let guide_ref = &guide;
+    // Update the guide file if it exists
+    match guides.guides.iter().position(|g| g.id == guide_ref.id) {
+        Some(index) => guides.guides[index] = guide,
+        None => guides.guides.push(guide),
+    }
+
+    Ok(())
+}
+
+fn add_or_replace_guides(guides: &mut Guides, new_guides: Vec<GuideWithSteps>) {
+    for guide in new_guides {
+        match guides.guides.iter().position(|g| g.id == guide.id) {
+            Some(index) => guides.guides[index] = guide,
+            None => guides.guides.push(guide),
+        }
+    }
+}
+
+/// Download a guide by its ID and save it into the specified folder
+async fn download_guide_by_id<R: Runtime>(
+    app: &AppHandle<R>,
+    guides: &mut Guides,
+    guide_id: u32,
+    folder: String,
+) -> Result<(), Error> {
+    let http_client = app.state::<reqwest::Client>();
+    let mut guide = get_guide_from_server(guide_id, &http_client).await?;
+
+    guide.folder = Some(app.path().app_guides_dir().join(folder.clone()));
+
+    debug!(
+        "[Guides] download_guide_by_id: {} in {:?} (via {})",
+        guide_id, guide.folder, folder
+    );
+
+    add_or_replace_guide(guides, guide)?;
+
+    Ok(())
+}
+
+async fn download_guides_by_ids<R: Runtime>(
+    app: &AppHandle<R>,
+    guides: &mut Guides,
+    guide_ids: Vec<u32>,
+) -> Result<(), Vec<Error>> {
+    let http_client = app.state::<reqwest::Client>();
+    let results = get_guides_from_server(guide_ids, &http_client).await;
+
+    let mut downloaded_guides = vec![];
+    let mut errors = vec![];
+
+    for result in results {
+        match result {
+            Ok(mut guide) => {
+                if let Some(existing_guide) = guides.guides.iter().find(|g| g.id == guide.id) {
+                    guide.folder = existing_guide.folder.clone();
+                }
+
+                debug!(
+                    "[Guides] download_guides_by_ids::for: {} in {:?}",
+                    guide.id, guide.folder
+                );
+
+                downloaded_guides.push(guide);
+            }
+            Err(error) => {
+                warn!("[Guides] download_guides_by_ids::for error: {}", error);
+                errors.push(error);
+            }
+        }
+    }
+
+    add_or_replace_guides(guides, downloaded_guides);
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+fn register_guide_open<R: Runtime>(
+    app_handle: AppHandle<R>,
+    guide_id: u32,
+    profile_id: String,
+) -> Result<(), Error> {
+    debug!("[Guides] register_guide_open for guide {guide_id} profile {profile_id}");
+
+    let recent_guides_path = app_handle.path().app_recent_guides_file();
+
+    let mut recent_guides = read_recent_guides_file(&recent_guides_path, &profile_id)?;
+
+    // Only a startup hint: never block registering the tab.
+    if let Err(err) = set_last_focused_guide(&app_handle, &profile_id, guide_id) {
+        warn!("[Guides] cannot save last focused guide: {err}");
+    }
+
+    let profile_guides = recent_guides.entry(profile_id).or_default();
+
+    if !profile_guides.contains(&guide_id) {
+        profile_guides.push(guide_id);
+        if profile_guides.len() > MAX_RECENT_GUIDES {
+            let overflow = profile_guides.len() - MAX_RECENT_GUIDES;
+            profile_guides.drain(0..overflow);
+        }
+
+        write_recent_guides_file(&recent_guides_path, &recent_guides)?;
+    }
+
+    Ok(())
+}
+
+fn register_guide_close<R: Runtime>(
+    app_handle: AppHandle<R>,
+    guide_id: u32,
+    profile_id: String,
+) -> Result<(), Error> {
+    debug!("[Guides] register_guide_close for guide {guide_id} profile {profile_id}");
+
+    let recent_guides_path = app_handle.path().app_recent_guides_file();
+
+    let mut recent_guides = read_recent_guides_file(&recent_guides_path, &profile_id)?;
+
+    if let Some(profile_guides) = recent_guides.get_mut(&profile_id) {
+        profile_guides.retain(|&id| id != guide_id);
+        write_recent_guides_file(&recent_guides_path, &recent_guides)?;
+    }
+
+    Ok(())
+}
+
+fn get_recent_guides<R: Runtime>(
+    app_handle: AppHandle<R>,
+    profile_id: String,
+) -> Result<Vec<u32>, Error> {
+    debug!("[Guides] get_recent_guides for profile {profile_id}");
+
+    let recent_guides_path = app_handle.path().app_recent_guides_file();
+
+    let recent_guides = read_recent_guides_file(&recent_guides_path, &profile_id)?;
+    let guides_in_system = get_guides_from_handle(&app_handle, "".to_string())?.guides;
+    let guide_ids_in_system = guides_in_system
+        .iter()
+        .map(|guide| guide.id)
+        .collect::<HashSet<_>>();
+
+    let mut profile_guides = recent_guides.get(&profile_id).cloned().unwrap_or_default();
+
+    // remove any guide IDs that are no longer in the system since the last session
+    profile_guides.retain(|id| guide_ids_in_system.contains(id));
+
+    Ok(sanitize_recent_guides(profile_guides))
+}
+
+fn get_last_focused_guide<R: Runtime>(
+    app_handle: AppHandle<R>,
+    profile_id: String,
+) -> Result<Option<u32>, Error> {
+    let path = app_handle.path().app_last_focused_guides_file();
+
+    Ok(read_last_focused_guides_file(&path)?
+        .get(&profile_id)
+        .copied())
+}
+
+fn set_last_focused_guide<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    profile_id: &str,
+    guide_id: u32,
+) -> Result<(), Error> {
+    let path = app_handle.path().app_last_focused_guides_file();
+    let mut last_focused_guides = read_last_focused_guides_file(&path)?;
+
+    if last_focused_guides.insert(profile_id.to_string(), guide_id) != Some(guide_id) {
+        write_last_focused_guides_file(&path, &last_focused_guides)?;
+    }
+
+    Ok(())
+}
+
+fn set_recent_guides<R: Runtime>(
+    app_handle: AppHandle<R>,
+    profile_id: String,
+    guide_ids: Vec<u32>,
+) -> Result<(), Error> {
+    debug!(
+        "[Guides] set_recent_guides for profile {profile_id}: {:?}",
+        guide_ids
+    );
+
+    let recent_guides_path = app_handle.path().app_recent_guides_file();
+    let mut recent_guides = read_recent_guides_file(&recent_guides_path, &profile_id)?;
+
+    recent_guides.insert(profile_id, sanitize_recent_guides(guide_ids));
+    write_recent_guides_file(&recent_guides_path, &recent_guides)?;
+
+    Ok(())
+}
+
+fn remove_profile_from_recent_guides<R: Runtime>(
+    app_handle: AppHandle<R>,
+    profile_id: String,
+) -> Result<(), Error> {
+    debug!("[Guides] remove_profile_from_recent_guides for profile {profile_id}");
+
+    let recent_guides_path = app_handle.path().app_recent_guides_file();
+
+    let mut recent_guides = read_recent_guides_file(&recent_guides_path, &profile_id)?;
+
+    if recent_guides.remove(&profile_id).is_some() {
+        write_recent_guides_file(&recent_guides_path, &recent_guides)?;
+    }
+
+    let last_focused_guides_path = app_handle.path().app_last_focused_guides_file();
+    let mut last_focused_guides = read_last_focused_guides_file(&last_focused_guides_path)?;
+
+    if last_focused_guides.remove(&profile_id).is_some() {
+        write_last_focused_guides_file(&last_focused_guides_path, &last_focused_guides)?;
+    }
+
+    Ok(())
+}
+
+fn write_recent_guides_file(
+    recent_guides_path: &PathBuf,
+    recent_guides: &RecentGuides,
+) -> Result<(), Error> {
+    let recent_guides = sanitize_recent_guides_by_profile(recent_guides);
+    let json =
+        crate::json::serialize_pretty(&recent_guides).map_err(Error::SerializeRecentGuidesFile)?;
+
+    debug!(
+        "[Guides] writing recent guides file: {:?}",
+        recent_guides_path
+    );
+
+    fs::write(recent_guides_path.as_path(), json)
+        .map_err(|err| Error::WriteRecentGuidesFile(err.to_string()))?;
+
+    Ok(())
+}
+
+fn read_last_focused_guides_file(path: &Path) -> Result<LastFocusedGuides, Error> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let file = fs::read_to_string(path)
+        .map_err(|err| Error::ReadRecentGuidesFile(format!("last focused guides file: {err}")))?;
+
+    // Only a startup hint: a malformed file must not block the app, it is rewritten on next focus.
+    Ok(
+        crate::json::from_str::<LastFocusedGuides>(&file).unwrap_or_else(|_| {
+            warn!("[Guides] malformed last focused guides file, ignoring it");
+            HashMap::new()
+        }),
+    )
+}
+
+fn write_last_focused_guides_file(
+    path: &Path,
+    last_focused_guides: &LastFocusedGuides,
+) -> Result<(), Error> {
+    let json = crate::json::serialize_pretty(last_focused_guides)
+        .map_err(Error::SerializeRecentGuidesFile)?;
+
+    fs::write(path, json)
+        .map_err(|err| Error::WriteRecentGuidesFile(format!("last focused guides file: {err}")))
+}
+
+fn sanitize_recent_guides_by_profile(recent_guides: &RecentGuides) -> RecentGuides {
+    recent_guides
+        .iter()
+        .map(|(profile_id, guide_ids)| {
+            (
+                profile_id.clone(),
+                sanitize_recent_guides(guide_ids.clone()),
+            )
+        })
+        .collect()
+}
+
+fn sanitize_recent_guides(guide_ids: Vec<u32>) -> Vec<u32> {
+    let mut sanitized = Vec::with_capacity(guide_ids.len().min(MAX_RECENT_GUIDES));
+    let mut seen = HashSet::with_capacity(guide_ids.len().min(MAX_RECENT_GUIDES));
+
+    for guide_id in guide_ids {
+        if seen.insert(guide_id) {
+            sanitized.push(guide_id);
+        }
+    }
+
+    if sanitized.len() > MAX_RECENT_GUIDES {
+        let overflow = sanitized.len() - MAX_RECENT_GUIDES;
+        sanitized.drain(0..overflow);
+    }
+
+    sanitized
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{
+        delete_recovered_quarantined_files, find_quarantined_guide_files, get_guides_from_path,
+        quarantined_guide_file_name, quarantined_guide_id, sanitize_recent_guides, GuideWithSteps,
+        Guides, UpdateAllAtOnceResult, MAX_RECENT_GUIDES,
+    };
+
+    fn guide_with_id(id: u32) -> GuideWithSteps {
+        let json = format!(
+            r#"{{"id":{},"name":"Valid","status":"public","likes":0,"dislikes":0,"lang":"fr","order":0,"user":{{"id":1,"name":"u","is_admin":0,"is_certified":0}},"steps":[]}}"#,
+            id
+        );
+
+        crate::json::from_str::<GuideWithSteps>(&json).unwrap()
+    }
+
+    #[test]
+    fn get_guides_from_path_skips_and_quarantines_malformed_files() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let valid = r#"{"id":42,"name":"Valid","status":"public","likes":0,"dislikes":0,"lang":"fr","order":0,"user":{"id":1,"name":"u","is_admin":0,"is_certified":0},"steps":[]}"#;
+
+        fs::write(dir.path().join("42.json"), valid).unwrap();
+        fs::write(dir.path().join("2022.json"), "").unwrap();
+
+        let guides = get_guides_from_path(&dir.path().to_path_buf()).unwrap();
+
+        assert_eq!(guides.guides.len(), 1);
+        assert_eq!(guides.guides[0].id, 42);
+
+        // the malformed file is quarantined (renamed) while the valid one is kept
+        assert!(!dir.path().join("2022.json").exists());
+        assert!(dir.path().join("2022.json.corrupted").exists());
+        assert!(dir.path().join("42.json").exists());
+
+        // a second scan skips the quarantined file and keeps the valid one
+        let guides = get_guides_from_path(&dir.path().to_path_buf()).unwrap();
+
+        assert_eq!(guides.guides.len(), 1);
+    }
+
+    #[test]
+    fn find_quarantined_guide_files_scans_subfolders() {
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let subfolder = dir.path().join("subfolder");
+
+        fs::create_dir_all(&subfolder).unwrap();
+        fs::write(dir.path().join("42.json"), "").unwrap();
+        fs::write(dir.path().join("2022.json.corrupted"), "").unwrap();
+        fs::write(subfolder.join("7.json.corrupted"), "").unwrap();
+
+        let mut quarantined = find_quarantined_guide_files(dir.path()).unwrap();
+        quarantined.sort();
+
+        assert_eq!(
+            quarantined,
+            vec![
+                dir.path().join("2022.json.corrupted"),
+                subfolder.join("7.json.corrupted"),
+            ]
+        );
+    }
+
+    #[test]
+    fn quarantined_guide_id_reads_the_original_file_name() {
+        let renamed = Path::new("my guide.json.corrupted");
+
+        assert_eq!(
+            quarantined_guide_file_name(Path::new("42.json.corrupted")),
+            "42.json"
+        );
+        assert_eq!(
+            quarantined_guide_id(Path::new("42.json.corrupted")),
+            Some(42)
+        );
+
+        assert_eq!(quarantined_guide_file_name(renamed), "my guide.json");
+        assert_eq!(quarantined_guide_id(renamed), None);
+    }
+
+    #[test]
+    fn delete_recovered_quarantined_files_keeps_the_ones_not_downloaded() {
+        use std::{collections::HashMap, fs};
+
+        let dir = tempfile::tempdir().unwrap();
+        let recovered = dir.path().join("42.json.corrupted");
+        let failed = dir.path().join("7.json.corrupted");
+
+        fs::write(&recovered, "").unwrap();
+        fs::write(&failed, "").unwrap();
+
+        let guides = Guides {
+            guides: vec![guide_with_id(42)],
+        };
+        let quarantined = vec![(42, recovered.clone()), (7, failed.clone())];
+        let results = HashMap::from([
+            (42, UpdateAllAtOnceResult::Success),
+            (
+                7,
+                UpdateAllAtOnceResult::Failure {
+                    message: "guide not found: 7".to_string(),
+                },
+            ),
+        ]);
+
+        delete_recovered_quarantined_files(&guides, &quarantined, &results);
+
+        assert!(!recovered.exists());
+        assert!(failed.exists());
+    }
+
+    #[test]
+    fn sanitize_recent_guides_removes_duplicates_preserving_order() {
+        let guide_ids = vec![3, 1, 3, 2, 1, 4];
+
+        assert_eq!(sanitize_recent_guides(guide_ids), vec![3, 1, 2, 4]);
+    }
+
+    #[test]
+    fn sanitize_recent_guides_caps_to_limit() {
+        let guide_ids = (1..=(MAX_RECENT_GUIDES as u32 + 10)).collect::<Vec<_>>();
+        let sanitized = sanitize_recent_guides(guide_ids);
+
+        assert_eq!(sanitized.len(), MAX_RECENT_GUIDES);
+        assert_eq!(sanitized.first(), Some(&11));
+        assert_eq!(sanitized.last(), Some(&(MAX_RECENT_GUIDES as u32 + 10)));
+    }
+}
+
+fn read_recent_guides_file(
+    recent_guides_path: &PathBuf,
+    profile_id: &str,
+) -> Result<RecentGuides, Error> {
+    if recent_guides_path.exists() {
+        debug!("[Guides] reading recent guides file");
+
+        let file = fs::read_to_string(recent_guides_path)
+            .map_err(|err| Error::ReadRecentGuidesFile(err.to_string()))?;
+
+        // Try new format: HashMap<String, Vec<u32>>
+        if let Ok(recent_guides) = crate::json::from_str::<RecentGuides>(&file) {
+            return Ok(recent_guides);
+        }
+
+        // Fallback: old format Vec<u32> -> migrate to current profile and persist
+        if let Ok(old_guides) = crate::json::from_str::<Vec<u32>>(&file) {
+            debug!("[Guides] old format detected, migrating to profile {profile_id}");
+            let mut migrated = HashMap::new();
+            migrated.insert(profile_id.to_string(), old_guides);
+            write_recent_guides_file(recent_guides_path, &migrated)?;
+            return Ok(migrated);
+        }
+
+        Err(Error::RecentGuidesFileMalformed(
+            "unknown format".to_string(),
+        ))
+    } else {
+        debug!("[Guides] recent guides file does not exist, returning empty HashMap");
+
+        Ok(HashMap::new())
+    }
+}
+
+fn fetch_guides_from_server<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    status: Option<Status>,
+) -> impl std::future::Future<Output = Result<Vec<Guide>, Error>> + Send {
+    let app_handle = app_handle.clone();
+    async move {
+        info!("[Guides] get_guides_from_server, status: {:?}", status);
+
+        #[cfg(not(debug_assertions))]
+        {
+            use tauri_plugin_sentry::sentry::{add_breadcrumb, protocol::Map, Breadcrumb};
+
+            add_breadcrumb(Breadcrumb {
+                ty: "sentry.transaction".into(),
+                message: Some("Get guides from server".into()),
+                data: {
+                    let mut map = Map::new();
+
+                    if let Some(status) = status.clone() {
+                        map.insert("status".into(), status.to_string().into());
+                    } else {
+                        map.insert("status".into(), "all".into());
+                    }
+
+                    map
+                },
+                ..Default::default()
+            });
+        }
+
+        let http_client = app_handle.state::<reqwest::Client>();
+
+        let url = if let Some(status) = status {
+            format!("{}/v2/guides?status={}", GANYMEDE_API, status.to_str())
+        } else {
+            format!("{}/v2/guides", GANYMEDE_API)
+        };
+
+        let res = http_client.get(url).send().await.map_err(|err| {
+            if err.is_connect() || err.is_timeout() {
+                Error::NetworkUnavailable
+            } else {
+                Error::RequestGuides(err.to_string())
+            }
+        })?;
+
+        let text = res
+            .text()
+            .await
+            .map_err(|err| Error::RequestGuidesContent(err.to_string()))?;
+
+        crate::json::from_str::<Vec<Guide>>(text.as_str()).map_err(Error::GuidesMalformed)
+    }
+}
+
+fn download_and_save_guide<R: Runtime>(
+    app: &AppHandle<R>,
+    guide_id: u32,
+    folder: String,
+) -> impl std::future::Future<Output = Result<Guides, Error>> + Send {
+    let app = app.clone();
+    async move {
+        info!("[Guides] download_guide_from_server");
+        #[cfg(not(debug_assertions))]
+        {
+            use tauri_plugin_sentry::sentry::{add_breadcrumb, protocol::Map, Breadcrumb};
+
+            add_breadcrumb(Breadcrumb {
+                ty: "sentry.transaction".into(),
+                message: Some("Download guide from server".into()),
+                data: {
+                    let mut map = Map::new();
+
+                    map.insert("guide_id".into(), guide_id.into());
+                    map.insert("folder".into(), folder.clone().into());
+
+                    map
+                },
+                ..Default::default()
+            });
+        }
+
+        let mut guides = get_guides_from_handle(&app, folder.clone())?;
+
+        download_guide_by_id(&app, &mut guides, guide_id, folder).await?;
+
+        write_guides(&guides, &app)?;
+
+        Ok(guides)
+    }
+}
+
+fn open_system_guides_folder<R: Runtime>(app: &AppHandle<R>) -> Result<(), Error> {
+    let resolver = app.app_handle().path();
+    let guides_dir = resolver.app_guides_dir();
+
+    app.opener()
+        .open_path(guides_dir.to_str().unwrap().to_string(), None::<String>)
+        .map_err(|err| Error::Opener(err.to_string()))
+}
+
+fn generate_guide_summary<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    guide_id: u32,
+) -> impl std::future::Future<Output = Result<Summary, Error>> + Send {
+    let app_handle = app_handle.clone();
+    async move {
+        let start = std::time::Instant::now();
+        info!("[Guides] get_guide_summary: {}", guide_id);
+
+        #[cfg(not(debug_assertions))]
+        {
+            use tauri_plugin_sentry::sentry::{add_breadcrumb, protocol::Map, Breadcrumb};
+
+            add_breadcrumb(Breadcrumb {
+                ty: "sentry.transaction".into(),
+                message: Some("Get guide summary".into()),
+                data: {
+                    let mut map = Map::new();
+
+                    map.insert("guide_id".into(), guide_id.into());
+
+                    map
+                },
+                ..Default::default()
+            });
+        }
+
+        let guides = get_guides_from_handle(&app_handle, "".to_string())?;
+        let guide = guides.guides.iter().find(|g| g.id == guide_id);
+
+        match guide {
+            Some(guide) => {
+                let mut quests: Vec<QuestSummary> = vec![];
+
+                for (step_index, step) in guide.steps.iter().enumerate() {
+                    let document = scraper::Html::parse_document(&step.web_text);
+
+                    let quest_selector =
+                        scraper::Selector::parse("[data-type='quest-block']").unwrap();
+
+                    for element in document.select(&quest_selector) {
+                        let quest_name = element.value().attr("questname");
+                        let status = element.value().attr("status");
+                        if let (Some(name), Some(status)) = (quest_name, status) {
+                            let summary_quest_status = match status {
+                                "setup" => SummaryQuestStatus::Setup(step_index as u32 + 1),
+                                "start" => SummaryQuestStatus::Started(step_index as u32 + 1),
+                                "in_progress" => {
+                                    SummaryQuestStatus::InProgress(step_index as u32 + 1)
+                                }
+                                "end" => SummaryQuestStatus::Completed(step_index as u32 + 1),
+                                _ => continue,
+                            };
+
+                            if let Some(quest) = quests.iter_mut().find(|q| q.name == name) {
+                                let in_vec_status =
+                                    quest.statuses.iter().any(|s| s == &summary_quest_status);
+
+                                if !in_vec_status {
+                                    quest.statuses.push(summary_quest_status);
+                                }
+                            } else {
+                                let mut statuses = vec![];
+                                statuses.push(summary_quest_status);
+                                quests.push(QuestSummary {
+                                    name: name.to_string(),
+                                    statuses,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                let duration = start.elapsed();
+
+                // Sort statuses within each quest by step number
+                for quest in &mut quests {
+                    quest.statuses.sort_by(|a, b| {
+                        let a_value = match a {
+                            SummaryQuestStatus::Setup(v)
+                            | SummaryQuestStatus::Started(v)
+                            | SummaryQuestStatus::InProgress(v)
+                            | SummaryQuestStatus::Completed(v) => v,
+                        };
+                        let b_value = match b {
+                            SummaryQuestStatus::Setup(v)
+                            | SummaryQuestStatus::Started(v)
+                            | SummaryQuestStatus::InProgress(v)
+                            | SummaryQuestStatus::Completed(v) => v,
+                        };
+                        a_value.cmp(&b_value)
+                    });
+
+                    debug!("[Guides] quest: {:?}", quest);
+                }
+
+                // Sort quests by their first non-setup status
+                quests.sort_by(|a, b| {
+                    let get_first_non_setup_step = |quest: &QuestSummary| -> Option<u32> {
+                        quest.statuses.iter().find_map(|s| match s {
+                            SummaryQuestStatus::Started(v)
+                            | SummaryQuestStatus::InProgress(v)
+                            | SummaryQuestStatus::Completed(v) => Some(*v),
+                            SummaryQuestStatus::Setup(_) => None,
+                        })
+                    };
+
+                    let a_step = get_first_non_setup_step(a);
+                    let b_step = get_first_non_setup_step(b);
+
+                    match (a_step, b_step) {
+                        (Some(a_val), Some(b_val)) => a_val.cmp(&b_val),
+                        (Some(_), None) => std::cmp::Ordering::Less, // Non-setup before setup-only
+                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                        (None, None) => {
+                            // Both setup-only: compare first status step
+                            let a_val = match a.statuses.first() {
+                                Some(SummaryQuestStatus::Setup(v)) => v,
+                                _ => unreachable!(),
+                            };
+                            let b_val = match b.statuses.first() {
+                                Some(SummaryQuestStatus::Setup(v)) => v,
+                                _ => unreachable!(),
+                            };
+                            a_val.cmp(b_val)
+                        }
+                    }
+                });
+
+                let summary = Summary { quests };
+
+                info!("[Guides] get_guide_summary: {} in {:?}", guide_id, duration);
+
+                Ok(summary)
+            }
+            None => Err(Error::GetGuideInSystem(guide_id)),
+        }
+    }
+}
+
+async fn update_all_guides_batch<R: Runtime>(
+    app_handle: &AppHandle<R>,
+) -> Result<HashMap<u32, UpdateAllAtOnceResult>, Error> {
+    info!("[Guides] update_all_guides_batch");
+
+    let mut guides = get_guides_from_handle(app_handle, "".to_string())?;
+    let mut guide_ids: Vec<u32> = guides.guides.iter().map(|g| g.id).collect();
+
+    // Guides edited locally (and guides created in the app, which the server does not
+    // know about) are left untouched: overwriting them would silently destroy the work
+    // of the user. They are reported as `Skipped` so the UI can explain why.
+    let mut skipped_ids: Vec<u32> = vec![];
+
+    guide_ids.retain(|id| {
+        let is_local_only = *id >= LOCAL_GUIDE_ID_BASE;
+        let is_locally_edited = guides
+            .guides
+            .iter()
+            .any(|guide| guide.id == *id && guide.local_edit.is_some());
+
+        if is_local_only || is_locally_edited {
+            info!("[Guides] skipping locally edited guide {}", id);
+            skipped_ids.push(*id);
+
+            return false;
+        }
+
+        true
+    });
+
+    // Quarantined guides are downloaded again so a local corruption heals itself on
+    // the next update instead of waiting for a manual delete. See issues #209 and #223.
+    let quarantined = quarantined_guides_to_recover(app_handle)?;
+
+    for (id, file_path) in &quarantined {
+        info!(
+            "[Guides] recovering quarantined guide {} from {:?}",
+            id, file_path
+        );
+
+        if !guide_ids.contains(id) {
+            guide_ids.push(*id);
+        }
+    }
+
+    let result = download_guides_by_ids(app_handle, &mut guides, guide_ids.clone()).await;
+
+    // A recovered guide is unknown to the local list, so it inherits the folder of the
+    // quarantined file it replaces instead of landing back in the guides root.
+    for (id, file_path) in &quarantined {
+        if let Some(guide) = guides
+            .guides
+            .iter_mut()
+            .find(|guide| guide.id == *id && guide.folder.is_none())
+        {
+            guide.folder = file_path.parent().map(|parent| parent.to_path_buf());
+        }
+    }
+
+    let mut results = HashMap::new();
+
+    match result {
+        Ok(()) => {
+            for id in guide_ids {
+                results.insert(id, UpdateAllAtOnceResult::Success);
+            }
+        }
+        Err(errors) => {
+            // If all errors are network errors, treat as success (offline mode)
+            let all_network_errors = errors
+                .iter()
+                .all(|e| matches!(e, Error::NetworkUnavailable));
+
+            if all_network_errors {
+                for id in guide_ids {
+                    results.insert(id, UpdateAllAtOnceResult::Offline);
+                }
+            } else {
+                let mut error_ids: Vec<u32> = vec![];
+
+                for error in errors {
+                    match error {
+                        Error::GuideNotFound(id) => {
+                            results.insert(
+                                id,
+                                UpdateAllAtOnceResult::Failure {
+                                    message: error.to_string(),
+                                },
+                            );
+                            error_ids.push(id);
+                        }
+                        _ => {
+                            for id in &guide_ids {
+                                if !error_ids.contains(id) {
+                                    results
+                                        .entry(*id)
+                                        .or_insert(UpdateAllAtOnceResult::Failure {
+                                            message: error.to_string(),
+                                        });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for id in guide_ids {
+                    if !results.contains_key(&id) {
+                        results.insert(id, UpdateAllAtOnceResult::Success);
+                    }
+                }
+            }
+        }
+    }
+
+    for id in skipped_ids {
+        results.insert(id, UpdateAllAtOnceResult::Skipped);
+    }
+
+    write_guides(&guides, app_handle)?;
+
+    delete_recovered_quarantined_files(&guides, &quarantined, &results);
+
+    Ok(results)
+}
+
+/// Quarantined files (see #209) whose name still carries a guide id, so the guide can
+/// be downloaded again from the server. Files renamed by hand are left untouched, the
+/// corrupted guides toast remains the only way to get rid of them. See issue #223.
+fn quarantined_guides_to_recover<R: Runtime>(
+    app_handle: &AppHandle<R>,
+) -> Result<Vec<(u32, PathBuf)>, Error> {
+    let guides_dir = app_handle.path().app_guides_dir();
+
+    let to_recover = find_quarantined_guide_files(&guides_dir)?
+        .into_iter()
+        .filter_map(|file_path| quarantined_guide_id(&file_path).map(|id| (id, file_path)))
+        .collect();
+
+    Ok(to_recover)
+}
+
+/// Drop the quarantined files whose guide is now on disk again. A failed download keeps
+/// its file so the corrupted guides toast still surfaces it. See issue #223.
+fn delete_recovered_quarantined_files(
+    guides: &Guides,
+    quarantined: &[(u32, PathBuf)],
+    results: &HashMap<u32, UpdateAllAtOnceResult>,
+) {
+    for (id, file_path) in quarantined {
+        let recovered = matches!(results.get(id), Some(UpdateAllAtOnceResult::Success))
+            && guides.guides.iter().any(|guide| guide.id == *id);
+
+        if !recovered {
+            continue;
+        }
+
+        info!(
+            "[Guides] deleting recovered quarantined guide file {:?}",
+            file_path
+        );
+
+        if let Err(err) = fs::remove_file(file_path) {
+            warn!(
+                "[Guides] failed to delete recovered quarantined guide file {:?}: {}",
+                file_path, err
+            );
+        }
+    }
+}
+
+fn check_guides_need_update<R: Runtime>(
+    app_handle: &AppHandle<R>,
+) -> impl std::future::Future<Output = Result<bool, Error>> + Send {
+    let app_handle = app_handle.clone();
+    async move {
+        info!("[Guides] has_guides_not_updated");
+
+        let guides_in_server = match fetch_guides_from_server(&app_handle, None).await {
+            Ok(guides) => guides,
+            Err(Error::NetworkUnavailable) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+
+        let guides_in_system = get_guides_from_handle(&app_handle, "".to_string())?;
+
+        for guide in guides_in_server {
+            if let Some(guide_in_system) = guides_in_system.guides.iter().find(|g| g.id == guide.id)
+            {
+                // A locally edited guide is never updated, so it must not raise the
+                // "updates are available" hint either.
+                if guide_in_system.local_edit.is_some() {
+                    continue;
+                }
+
+                if guide.updated_at != guide_in_system.updated_at {
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+}
+
+fn delete_guides_and_folders<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    guides_or_folders_to_delete: Vec<GuideOrFolderToDelete>,
+) -> Result<(), Error> {
+    info!(
+        "[Guides] delete_guides_from_system: {:?}",
+        guides_or_folders_to_delete
+    );
+
+    let guides_dir = app_handle.path().app_guides_dir();
+
+    for guide_or_folder_to_delete in guides_or_folders_to_delete {
+        let mut path = guides_dir.clone();
+
+        match guide_or_folder_to_delete {
+            GuideOrFolderToDelete::Guide { id, folder } => {
+                if let Some(folder) = folder {
+                    path = path.join(folder);
+                }
+
+                path = path.join(format!("{}.json", id));
+            }
+            GuideOrFolderToDelete::Folder { folder } => {
+                path = path.join(folder);
+            }
+        }
+
+        info!("[Guides] deleting the following path: {:?}", path);
+
+        if path.exists() {
+            if path.is_dir() {
+                fs::remove_dir_all(path)
+                    .map_err(|err| Error::DeleteGuideFolderInSystem(err.to_string()))?;
+            } else {
+                fs::remove_file(path)
+                    .map_err(|err| Error::DeleteGuideFileInSystem(err.to_string()))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn check_guide_exists<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    guide_id: u32,
+) -> impl std::future::Future<Output = Result<bool, Error>> + Send {
+    let app_handle = app_handle.clone();
+    async move {
+        debug!("[Guides] Checking if guide {} exists", guide_id);
+
+        let guides = get_guides_from_handle(&app_handle, "".to_string())?;
+        let exists = guides.guides.iter().any(|g| g.id == guide_id);
+
+        debug!("[Guides] Guide {} exists: {}", guide_id, exists);
+        Ok(exists)
+    }
+}
+
+// ================================================================================================
+// TauRPC API Trait & Implementation
+// ================================================================================================
+
+#[taurpc::procedures(path = "guides", event_trigger = GuidesEventTrigger, export_to = "../src/ipc/bindings.ts")]
+pub trait GuidesApi {
+    #[taurpc(alias = "getFlatGuides")]
+    async fn get_flat_guides<R: Runtime>(
+        app_handle: AppHandle<R>,
+        folder: String,
+    ) -> Result<Vec<GuideWithSteps>, Error>;
+    #[taurpc(alias = "getGuides")]
+    async fn get_guides<R: Runtime>(
+        app_handle: AppHandle<R>,
+        folder: Option<String>,
+    ) -> Result<Vec<GuidesOrFolder>, Error>;
+    #[taurpc(alias = "getGuideFromServer")]
+    async fn get_guide_from_server<R: Runtime>(
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+    ) -> Result<GuideWithSteps, Error>;
+    #[taurpc(alias = "getGuidesFromServer")]
+    async fn get_guides_from_server<R: Runtime>(
+        app_handle: AppHandle<R>,
+        status: Option<Status>,
+    ) -> Result<Vec<Guide>, Error>;
+    #[taurpc(alias = "downloadGuideFromServer")]
+    async fn download_guide_from_server<R: Runtime>(
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+        folder: String,
+    ) -> Result<Guides, Error>;
+    #[taurpc(alias = "openGuidesFolder")]
+    async fn open_guides_folder<R: Runtime>(app_handle: AppHandle<R>) -> Result<(), Error>;
+    #[taurpc(alias = "getGuideSummary")]
+    async fn get_guide_summary<R: Runtime>(
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+    ) -> Result<Summary, Error>;
+    #[taurpc(alias = "updateAllAtOnce")]
+    async fn update_all_at_once<R: Runtime>(
+        app_handle: AppHandle<R>,
+    ) -> Result<HashMap<u32, UpdateAllAtOnceResult>, Error>;
+    #[taurpc(alias = "hasGuidesNotUpdated")]
+    async fn has_guides_not_updated<R: Runtime>(app_handle: AppHandle<R>) -> Result<bool, Error>;
+    #[taurpc(alias = "deleteGuidesFromSystem")]
+    async fn delete_guides_from_system<R: Runtime>(
+        app_handle: AppHandle<R>,
+        guides_or_folders_to_delete: Vec<GuideOrFolderToDelete>,
+    ) -> Result<(), Error>;
+    #[taurpc(alias = "getCorruptedGuides")]
+    async fn get_corrupted_guides<R: Runtime>(
+        app_handle: AppHandle<R>,
+    ) -> Result<Vec<QuarantinedGuideFile>, Error>;
+    #[taurpc(alias = "deleteCorruptedGuides")]
+    async fn delete_corrupted_guides<R: Runtime>(app_handle: AppHandle<R>) -> Result<(), Error>;
+    #[taurpc(alias = "saveGuide")]
+    async fn save_guide<R: Runtime>(
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+        name: String,
+        steps: Vec<GuideStep>,
+    ) -> Result<GuideWithSteps, Error>;
+    #[taurpc(alias = "createLocalGuide")]
+    async fn create_local_guide<R: Runtime>(
+        app_handle: AppHandle<R>,
+        name: String,
+        folder: String,
+    ) -> Result<GuideWithSteps, Error>;
+    #[taurpc(alias = "duplicateGuide")]
+    async fn duplicate_guide<R: Runtime>(
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+    ) -> Result<GuideWithSteps, Error>;
+    #[taurpc(alias = "revertGuideToServer")]
+    async fn revert_guide_to_server<R: Runtime>(
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+    ) -> Result<GuideWithSteps, Error>;
+    #[taurpc(event, alias = "copyCurrentGuideStep")]
+    async fn copy_current_guide_step<R: Runtime>(app_handle: AppHandle<R>);
+    #[taurpc(event, alias = "guidesUpdatedAtLaunch")]
+    async fn guides_updated_at_launch<R: Runtime>(app_handle: AppHandle<R>);
+    #[taurpc(alias = "guideExists")]
+    async fn guide_exists<R: Runtime>(
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+    ) -> Result<bool, Error>;
+    #[taurpc(alias = "registerGuideOpen")]
+    async fn register_guide_open<R: Runtime>(
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+        profile_id: String,
+    ) -> Result<(), Error>;
+    #[taurpc(alias = "registerGuideClose")]
+    async fn register_guide_close<R: Runtime>(
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+        profile_id: String,
+    ) -> Result<(), Error>;
+    #[taurpc(alias = "getRecentGuides")]
+    async fn get_recent_guides<R: Runtime>(
+        app_handle: AppHandle<R>,
+        profile_id: String,
+    ) -> Result<Vec<u32>, Error>;
+    #[taurpc(alias = "getLastFocusedGuide")]
+    async fn get_last_focused_guide<R: Runtime>(
+        app_handle: AppHandle<R>,
+        profile_id: String,
+    ) -> Result<Option<u32>, Error>;
+    #[taurpc(alias = "setRecentGuides")]
+    async fn set_recent_guides<R: Runtime>(
+        app_handle: AppHandle<R>,
+        profile_id: String,
+        guide_ids: Vec<u32>,
+    ) -> Result<(), Error>;
+    #[taurpc(alias = "removeProfileFromRecentGuides")]
+    async fn remove_profile_from_recent_guides<R: Runtime>(
+        app_handle: AppHandle<R>,
+        profile_id: String,
+    ) -> Result<(), Error>;
+}
+
+#[derive(Clone)]
+pub struct GuidesApiImpl;
+
+#[taurpc::resolvers]
+impl GuidesApi for GuidesApiImpl {
+    async fn get_flat_guides<R: Runtime>(
+        self,
+        app: AppHandle<R>,
+        folder: String,
+    ) -> Result<Vec<GuideWithSteps>, Error> {
+        let guides = get_guides_from_handle(&app, folder)?;
+
+        Ok(guides.guides.into_iter().collect())
+    }
+
+    async fn get_guides<R: Runtime>(
+        self,
+        app: AppHandle<R>,
+        folder: Option<String>,
+    ) -> Result<Vec<GuidesOrFolder>, Error> {
+        get_guides_or_folder_from_handle(&app, folder)
+    }
+
+    async fn get_guide_from_server<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+    ) -> Result<GuideWithSteps, Error> {
+        get_guide_from_server(guide_id, &app_handle.state::<reqwest::Client>()).await
+    }
+
+    async fn get_guides_from_server<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        status: Option<Status>,
+    ) -> Result<Vec<Guide>, Error> {
+        fetch_guides_from_server(&app_handle, status).await
+    }
+
+    async fn download_guide_from_server<R: Runtime>(
+        self,
+        app: AppHandle<R>,
+        guide_id: u32,
+        folder: String,
+    ) -> Result<Guides, Error> {
+        download_and_save_guide(&app, guide_id, folder).await
+    }
+
+    async fn open_guides_folder<R: Runtime>(self, app: AppHandle<R>) -> Result<(), Error> {
+        open_system_guides_folder(&app)
+    }
+
+    async fn get_guide_summary<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+    ) -> Result<Summary, Error> {
+        generate_guide_summary(&app_handle, guide_id).await
+    }
+
+    async fn update_all_at_once<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+    ) -> Result<HashMap<u32, UpdateAllAtOnceResult>, Error> {
+        update_all_guides_batch(&app_handle).await
+    }
+
+    async fn has_guides_not_updated<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+    ) -> Result<bool, Error> {
+        check_guides_need_update(&app_handle).await
+    }
+
+    async fn delete_guides_from_system<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        guides_or_folders_to_delete: Vec<GuideOrFolderToDelete>,
+    ) -> Result<(), Error> {
+        delete_guides_and_folders(&app_handle, guides_or_folders_to_delete)
+    }
+
+    async fn get_corrupted_guides<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+    ) -> Result<Vec<QuarantinedGuideFile>, Error> {
+        list_corrupted_guides(&app_handle)
+    }
+
+    async fn delete_corrupted_guides<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+    ) -> Result<(), Error> {
+        delete_corrupted_guides(&app_handle)
+    }
+
+    async fn save_guide<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+        name: String,
+        steps: Vec<GuideStep>,
+    ) -> Result<GuideWithSteps, Error> {
+        save_guide_locally(&app_handle, guide_id, name, steps)
+    }
+
+    async fn create_local_guide<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        name: String,
+        folder: String,
+    ) -> Result<GuideWithSteps, Error> {
+        create_guide_locally(&app_handle, name, folder)
+    }
+
+    async fn duplicate_guide<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+    ) -> Result<GuideWithSteps, Error> {
+        duplicate_guide_locally(&app_handle, guide_id)
+    }
+
+    async fn revert_guide_to_server<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+    ) -> Result<GuideWithSteps, Error> {
+        revert_guide_locally_to_server(&app_handle, guide_id).await
+    }
+
+    async fn guide_exists<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+    ) -> Result<bool, Error> {
+        check_guide_exists(&app_handle, guide_id).await
+    }
+
+    async fn register_guide_open<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+        profile_id: String,
+    ) -> Result<(), Error> {
+        register_guide_open(app_handle, guide_id, profile_id)
+    }
+
+    async fn register_guide_close<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        guide_id: u32,
+        profile_id: String,
+    ) -> Result<(), Error> {
+        register_guide_close(app_handle, guide_id, profile_id)
+    }
+
+    async fn get_recent_guides<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        profile_id: String,
+    ) -> Result<Vec<u32>, Error> {
+        get_recent_guides(app_handle, profile_id)
+    }
+
+    async fn get_last_focused_guide<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        profile_id: String,
+    ) -> Result<Option<u32>, Error> {
+        get_last_focused_guide(app_handle, profile_id)
+    }
+
+    async fn set_recent_guides<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        profile_id: String,
+        guide_ids: Vec<u32>,
+    ) -> Result<(), Error> {
+        set_recent_guides(app_handle, profile_id, guide_ids)
+    }
+
+    async fn remove_profile_from_recent_guides<R: Runtime>(
+        self,
+        app_handle: AppHandle<R>,
+        profile_id: String,
+    ) -> Result<(), Error> {
+        remove_profile_from_recent_guides(app_handle, profile_id)
+    }
+}

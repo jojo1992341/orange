@@ -1,0 +1,61 @@
+[package]
+name = "ganymede"
+version = "1.21.0"
+description = "Dofus Ganymede app."
+authors = ["Kiyozz"]
+edition = "2021"
+links = "https://ganymede-app.com"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "ganymede_app_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0.3", features = [] }
+
+[dependencies]
+uuid = { version = "1", features = ["v6", "fast-rng"] }
+tauri = { version = "2", features = ["macos-private-api"] }
+specta = { version = "=2.0.0-rc.22", features = ["derive"] }
+specta-typescript = "0.0.9"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri-plugin-http = "2"
+serde_path_to_error = "0.1.17"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-global-shortcut = "2"
+glob = "0.3.3"
+chrono = "0.4.42"
+semver = "1.0.26"
+tauri-plugin-os = "2"
+tauri-plugin-sentry = "0.2"
+thiserror = "2"
+tauri-plugin-log = "2"
+log = "0.4.26"
+taurpc = { version = "0.5.2" }
+tauri-plugin-opener = "2"
+chrono-tz = "0.10.1"
+scraper = "0.24.0"
+tauri-plugin-deep-link = "2"
+regex = "1"
+base64 = "0.22.1"
+sha2 = "0.10.8"
+rand = "0.9.2"
+urlencoding = "2"
+md5 = "0.7"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-app-kit = "0.3"
+tauri-nspanel = { git = "https://github.com/ahkohd/tauri-nspanel", branch = "v2" }
+
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-window-state = "2"
+machine-uid = "0.5.3"
+tauri-plugin-updater = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
